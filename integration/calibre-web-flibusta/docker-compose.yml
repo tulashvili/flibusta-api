@@ -1,0 +1,27 @@
+services:
+  calibre-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+      - FLIBUSTA_SIDECAR_URL=http://flibusta-sidecar:8080
+    volumes:
+      - ./data/config:/config
+      - ./data/books:/books
+    ports:
+      - "8083:8083"
+    depends_on:
+      - flibusta-sidecar
+    restart: unless-stopped
+
+  flibusta-sidecar:
+    build:
+      context: ./sidecar
+      dockerfile: Dockerfile
+    environment:
+      - FLIBUSTA_BASE_URL=http://flibusta.is/
+      - PORT=8080
+    restart: unless-stopped

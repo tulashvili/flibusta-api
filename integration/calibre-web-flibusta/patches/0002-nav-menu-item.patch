@@ -1,0 +1,12 @@
+--- a/cps/templates/layout.html
++++ b/cps/templates/layout.html
+@@ -85,6 +85,9 @@
+                       </div>
+                     </form>
+                   </li>
++                  <li id="nav_flibusta">
++                    <a href="{{ url_for('flibusta.index') }}" id="top_flibusta" data-text="{{_('Download Books')}}"><span class="glyphicon glyphicon-download-alt"></span> <span class="hidden-sm">{{_('Download Books')}}</span></a>
++                  </li>
+               {% endif %}
+               {% if not current_user.is_anonymous and not simple%}
+                 <li class="top_tasks"><a id="top_tasks" href="{{url_for('tasks.get_tasks_status')}}"><span class="glyphicon glyphicon-tasks"></span> <span class="hidden-sm">{{_('Tasks')}}</span></a></li>
