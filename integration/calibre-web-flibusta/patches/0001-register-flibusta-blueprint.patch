@@ -1,0 +1,18 @@
+--- a/cps/main.py
++++ b/cps/main.py
+@@ -43,6 +43,7 @@
+     from .tasks_status import tasks
+     from .error_handler import init_errorhandler
+     from .remotelogin import remotelogin
++    from .flibusta import flibusta
+     try:
+         from .kobo import kobo, get_kobo_activated
+         from .kobo_auth import kobo_auth
+@@ -76,6 +77,7 @@
+     app.register_blueprint(meta)
+     app.register_blueprint(gdrive)
+     app.register_blueprint(editbook)
++    app.register_blueprint(flibusta)
+     if kobo_available:
+         limiter.limit("3/minute", key_func=get_remote_address)(kobo)
+         app.register_blueprint(kobo)

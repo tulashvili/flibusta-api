@@ -1,0 +1,36 @@
+{% extends "layout.html" %}
+{% block body %}
+<div class="col-sm-12">
+  <h2>{{ _('Download Books from Flibusta') }}</h2>
+  <div id="flibusta-error" class="alert alert-danger" style="display:none"></div>
+  <form id="flibusta-search-form" class="form-inline">
+    <input type="text" id="flibusta-q" class="form-control" style="width:60%"
+           placeholder="{{ _('Search by title or author') }}" autocomplete="off">
+    <button type="submit" class="btn btn-primary">{{ _('Search') }}</button>
+  </form>
+  <div id="flibusta-results" class="row"></div>
+  <button id="flibusta-more" class="btn btn-default" style="display:none">{{ _('Load more') }}</button>
+</div>
+<link rel="stylesheet" href="{{ url_for('flibusta.static', filename='flibusta.css') }}">
+<script>
+  window.FLIBUSTA = {
+    searchUrl: "{{ url_for('flibusta.search') }}",
+    addUrl: "{{ url_for('flibusta.add') }}",
+    bookUrlTemplate: "{{ url_for('web.show_book', book_id=0) }}",
+    csrfToken: "{{ csrf_token() }}",
+    i18n: {
+      inLibrary: "{{ _('In library') }}",
+      add: "{{ _('Add') }}",
+      open: "{{ _('Open') }}",
+      loading: "{{ _('Loading...') }}",
+      failed: "{{ _('Failed') }}",
+      primary: "{{ _('primary') }}",
+      alreadyThere: "{{ _('already present') }}",
+      notAdded: "{{ _('failed') }}",
+      searchFailed: "{{ _('Search failed') }}",
+      networkError: "{{ _('Network error') }}"
+    }
+  };
+</script>
+<script src="{{ url_for('flibusta.static', filename='flibusta.js') }}"></script>
+{% endblock %}

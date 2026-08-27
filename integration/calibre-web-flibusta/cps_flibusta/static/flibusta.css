@@ -1,0 +1,15 @@
+.flibusta-card { text-align: center; margin-bottom: 20px; }
+.flibusta-card img { max-height: 180px; margin-bottom: 8px; }
+.flibusta-title { font-weight: bold; }
+.flibusta-author, .flibusta-series { font-size: 0.9em; color: #777; }
+.flibusta-card select { margin-bottom: 6px; }
+#flibusta-search-form { margin-bottom: 20px; }
+#flibusta-more { display: block; margin: 0 auto 30px; }
+.flibusta-formats { margin-bottom: 6px; font-size: 0.9em; }
+.flibusta-fmt { display: inline-block; margin: 0 6px 2px 0; font-weight: normal; }
+.flibusta-primary-badge { color: #337ab7; font-size: 0.85em; }
+.flibusta-result { font-size: 0.85em; margin-bottom: 6px; }
+.flibusta-result span { margin-right: 6px; }
+.flibusta-ok { color: #3c763d; }
+.flibusta-skip { color: #777; }
+.flibusta-fail { color: #a94442; }

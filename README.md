@@ -52,6 +52,17 @@ yarn example-search-book-by-series-paginated [series name] [page number] [items 
 
 <hr />
 
+## Integrations
+
+### Calibre-Web
+
+[`integration/calibre-web-flibusta/`](integration/calibre-web-flibusta/README.md) — add
+books from Flibusta to a self-hosted Calibre-Web library from a search page inside
+Calibre-Web. A Node sidecar wraps this API; a Flask blueprint feeds downloads through
+Calibre-Web's own upload pipeline. See its README for architecture, setup, and tests.
+
+<hr />
+
 ## API
 
 ### getBooksByAuthorOpds(id)

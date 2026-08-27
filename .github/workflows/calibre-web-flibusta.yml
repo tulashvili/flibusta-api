@@ -1,0 +1,37 @@
+name: calibre-web-flibusta
+
+on:
+  pull_request:
+    paths: ["integration/calibre-web-flibusta/**"]
+  push:
+    branches: [master]
+    paths: ["integration/calibre-web-flibusta/**"]
+
+jobs:
+  sidecar:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integration/calibre-web-flibusta/sidecar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: npm test
+
+  blueprint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integration/calibre-web-flibusta
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The pinned Calibre-Web image has no flask-login (README §8); tests stub
+      # cps.cw_login instead. Deps are pinned in requirements-dev.txt.
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest tests -q
