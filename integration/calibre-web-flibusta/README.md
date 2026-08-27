@@ -2,9 +2,11 @@
 
 Add books from [Flibusta](http://flibusta.is) to a self-hosted
 [Calibre-Web](https://github.com/janeczku/calibre-web) library from a search page
-inside Calibre-Web itself. Search Flibusta, pick a format, and the book is downloaded,
-unpacked, and imported into your Calibre library through Calibre-Web's own upload
-pipeline (metadata, cover, identifier, dir structure).
+inside Calibre-Web itself. Search Flibusta, tick one or more formats on a result card,
+and the book is downloaded, unpacked, and imported into your Calibre library through
+Calibre-Web's own upload pipeline (metadata, cover, identifier, dir structure).
+The first ticked format creates (or locates) the book; every further ticked format is
+attached to that same book exactly like Calibre-Web's "Upload Format" button.
 
 ## Architecture
 
@@ -438,6 +440,100 @@ def move_coverfile(meta, db_book):
               category="error")
 ```
 
+### `upload_book_formats(requested_files, book, book_id, no_cover=True)` (backs the "Upload Format" button on the book edit page; used by `_attach_formats`)
+
+```python
+def upload_book_formats(requested_files, book, book_id, no_cover=True):
+    # Check and handle Uploaded file
+    to_save = dict()
+    error = False
+    allowed_extensions = config.config_upload_formats.split(',')
+    for requested_file in requested_files:
+        current_filename = requested_file.filename
+        if config.config_check_extensions and allowed_extensions != ['']:
+            if not validate_mime_type(requested_file, allowed_extensions):
+                flash(_("File type isn't allowed to be uploaded to this server"), category="error")
+                error = True
+                continue
+        if current_filename != '':
+            if not current_user.role_upload():
+                flash(_("User has no rights to upload additional file formats"), category="error")
+                error = True
+                continue
+            if '.' in current_filename:
+                file_ext = current_filename.rsplit('.', 1)[-1].lower()
+                if file_ext not in allowed_extensions and '' not in allowed_extensions:
+                    flash(_("File extension '%(ext)s' is not allowed to be uploaded to this server", ext=file_ext),
+                          category="error")
+                    error = True
+                    continue
+            else:
+                flash(_('File to be uploaded must have an extension'), category="error")
+                error = True
+                continue
+
+            file_name = book.path.rsplit('/', 1)[-1]
+            filepath = os.path.normpath(os.path.join(config.get_book_path(), book.path))
+            saved_filename = os.path.join(filepath, file_name + '.' + file_ext)
+
+            if not os.path.exists(filepath):
+                try:
+                    os.makedirs(filepath)
+                except OSError:
+                    flash(_("Failed to create path %(path)s (Permission denied).", path=filepath), category="error")
+                    error = True
+                    continue
+            try:
+                requested_file.save(saved_filename)
+            except OSError:
+                flash(_("Failed to store file %(file)s.", file=saved_filename), category="error")
+                error = True
+                continue
+
+            file_size = os.path.getsize(saved_filename)
+
+            # Format entry already exists, no need to update the database
+            if calibre_db.get_book_format(book_id, file_ext.upper()):
+                log.warning('Book format %s already existing', file_ext.upper())
+            else:
+                try:
+                    db_format = db.Data(book_id, file_ext.upper(), file_size, file_name)
+                    calibre_db.session.add(db_format)
+                    calibre_db.session.commit()
+                    calibre_db.create_functions(config)
+                except (OperationalError, IntegrityError, StaleDataError) as e:
+                    calibre_db.session.rollback()
+                    log.error_or_exception("Database error: {}".format(e))
+                    flash(_("Oops! Database Error: %(error)s.", error=e.orig if hasattr(e, "orig") else e), category="error")
+                    error = True
+                    continue
+
+            link = '<a href="{}">{}</a>'.format(url_for('web.show_book', book_id=book.id), escape(book.title))
+            upload_text = N_("File format %(ext)s added to %(book)s", ext=file_ext.upper(), book=link)
+            WorkerThread.add(current_user.name, TaskUpload(upload_text, escape(book.title)))
+            meta = uploader.process(
+                saved_filename,
+                *os.path.splitext(current_filename),
+                rar_executable=resolve_binary_path(config.config_rarfile_location, SUPPORTED_UNRAR_BINARIES),
+                no_cover=no_cover)
+            merge_metadata(book, meta, to_save)
+    return to_save, error
+```
+
+Notes for `_attach_formats`:
+
+* takes a `book` ORM object (`calibre_db.get_filtered_book(book_id,
+  allow_show_archived=True)`), a list of `FileStorage`, `book_id`, and `no_cover`
+  (we pass `book.has_cover`, so an existing cover is not overwritten);
+* saves each file as `<bookfolder>/<bookfolder>.<ext>` inside the book's existing
+  directory — no `update_dir_structure` / `move_coverfile` needed;
+* a format already on the book is logged and skipped, not an error — so the
+  blueprint snapshots `get_book_format` *before* the call to tell "already there"
+  from "just added";
+* returns `(to_save, error)` where `error` is a global "at least one file failed"
+  flag that does not say *which* — the per-format verdict comes from re-querying
+  `calibre_db.get_book_format(book_id, EXT.upper())` afterwards.
+
 ## 4. Import block — top of `cps/editbooks.py`
 
 ```python
@@ -753,6 +849,18 @@ confirmed against the pinned release". Confirmed differences:
   failure after `create_book_on_upload` can leave `<book_path>/<author>/<title>` behind,
   so the `except` branch also `shutil.rmtree`s the directory resolved from
   `db_book.path`, guarded to paths strictly under `config.get_book_path()`.
+- **Multiple formats per add** — `/add` takes `formats` (an ordered JSON list); the
+  singular `format` is still accepted and treated as a one-element list. `formats[0]` is
+  the primary and goes through `_import_into_library` unchanged; the rest go through
+  `_attach_formats`, which calls stock `cps.editbooks.upload_book_formats` (verbatim in
+  section 3). The response gained a `formats` object —
+  `{"added": [...], "skipped": [...], "failed": [...]}` — so a partial failure (a dead
+  download, a rejected file, a format the book already has) is reported per format
+  instead of failing the whole request. A dedup hit (`already_exists`) now also runs
+  `_attach_formats` for every requested format, so you can add `mobi` to a book that was
+  imported as `fb2` earlier. Only a failure of the **primary** format still yields the
+  404/502/503/500 responses.
+
 - **`create_book_on_upload` calls `db.Data(db_book, meta.extension.upper()[1:], ...)`** —
   so the DB format string is derived from `meta.extension`; the temp filename's extension
   is load-bearing for the format recorded in Calibre.

@@ -33,10 +33,14 @@
   function card(item) {
     var el = document.createElement('div');
     el.className = 'col-sm-3 flibusta-card';
-    var formats = item.formats || [];
-    var opts = formats.map(function (f) {
-      var name = f.format || f;
-      return '<option value="' + esc(name) + '">' + esc(String(name).toUpperCase()) + '</option>';
+    var formats = (item.formats || []).map(function (f) {
+      return String(f.format || f);
+    });
+    var boxes = formats.map(function (name) {
+      return '<label class="flibusta-fmt"><input type="checkbox" value="' + esc(name) +
+        '"> ' + esc(name.toUpperCase()) +
+        '<span class="flibusta-primary-badge" style="display:none"> ' +
+        esc(t.primary || 'основной') + '</span></label>';
     }).join('');
     var authors = (item.authors || []).map(function (a) {
       return a && a.name ? a.name : a;
@@ -50,15 +54,58 @@
       (item.alreadyInLibrary
         ? '<a class="btn btn-success btn-sm" href="' + esc(bookUrl(item.bookId)) + '">' +
           esc(t.inLibrary || 'In library') + '</a>'
-        : '<select class="form-control input-sm">' + opts + '</select>' +
-          '<button class="btn btn-primary btn-sm flibusta-add">' + esc(t.add || 'Add') + '</button>');
+        : '<div class="flibusta-formats">' + boxes + '</div>' +
+          '<div class="flibusta-result" style="display:none"></div>' +
+          '<button class="btn btn-primary btn-sm flibusta-add" disabled>' +
+          esc(t.add || 'Add') + '</button>');
 
     if (!item.alreadyInLibrary) {
       var btn = el.querySelector('.flibusta-add');
-      var sel = el.querySelector('select');
-      btn.addEventListener('click', function () { add(item, sel.value, btn); });
+      var inputs = [].slice.call(el.querySelectorAll('.flibusta-formats input'));
+      // Selection order is the contract: the FIRST checked format is the one
+      // that creates/locates the book, the rest are attached to it.
+      var chosen = [];
+
+      function sync() {
+        inputs.forEach(function (input) {
+          var badge = input.parentNode.querySelector('.flibusta-primary-badge');
+          badge.style.display = (chosen[0] === input.value) ? 'inline' : 'none';
+        });
+        btn.disabled = chosen.length === 0;
+      }
+
+      inputs.forEach(function (input) {
+        input.addEventListener('change', function () {
+          var at = chosen.indexOf(input.value);
+          if (input.checked) {
+            if (at === -1) { chosen.push(input.value); }
+          } else if (at !== -1) {
+            chosen.splice(at, 1);
+          }
+          sync();
+        });
+      });
+      sync();
+      btn.addEventListener('click', function () {
+        if (chosen.length) { add(item, chosen.slice(), btn, el); }
+      });
     }
     return el;
+  }
+
+  function formatReport(res) {
+    var f = res.formats || {};
+    var parts = [];
+    function chunk(list, cls, suffix) {
+      (list || []).forEach(function (name) {
+        parts.push('<span class="' + cls + '">' + esc(String(name).toUpperCase()) +
+          (suffix ? ' ' + esc(suffix) : '') + '</span>');
+      });
+    }
+    chunk(f.added, 'flibusta-ok', '');
+    chunk(f.skipped, 'flibusta-skip', t.alreadyThere || 'уже есть');
+    chunk(f.failed, 'flibusta-fail', t.notAdded || 'не удалось');
+    return parts.join(' ');
   }
 
   function jsonResponse(r) {
@@ -66,7 +113,7 @@
                          function () { return { ok: r.ok, j: {} }; });
   }
 
-  function add(item, format, btn) {
+  function add(item, formats, btn, el) {
     btn.disabled = true;
     btn.textContent = t.loading || 'Loading...';
     var headers = { 'Content-Type': 'application/json' };
@@ -75,12 +122,20 @@
       method: 'POST',
       credentials: 'same-origin',
       headers: headers,
-      body: JSON.stringify({ flibustaId: item.flibustaId, format: format, item: item })
+      body: JSON.stringify({ flibustaId: item.flibustaId, formats: formats, item: item })
     }).then(jsonResponse)
       .then(function (res) {
         if (res.ok && (res.j.status === 'added' || res.j.status === 'already_exists')) {
+          var report = el && el.querySelector('.flibusta-result');
+          if (report) {
+            report.innerHTML = formatReport(res.j);
+            report.style.display = 'block';
+          }
+          var got = ((res.j.formats || {}).added || []).concat(
+            (res.j.formats || {}).skipped || []);
+          var label = (t.open || 'Open') + (got.length ? ' — ' + got.join(', ') : '');
           btn.outerHTML = '<a class="btn btn-success btn-sm" href="' + esc(res.j.url) + '">' +
-            esc(t.open || 'Open') + '</a>';
+            esc(label) + '</a>';
         } else {
           btn.disabled = false;
           btn.textContent = t.add || 'Add';

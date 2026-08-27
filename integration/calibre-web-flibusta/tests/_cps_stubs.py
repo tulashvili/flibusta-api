@@ -25,6 +25,16 @@ def install():
     cps._flibusta_stub = True
     cps.__path__ = []  # make it a package so `cps.x` submodules resolve
     cps.calibre_db = types.SimpleNamespace(session=types.SimpleNamespace())
+    # Multi-format attach path. `_formats` is the per-test source of truth for
+    # which formats a book already carries; tests mutate it directly.
+    cps.calibre_db._formats = set()
+    cps.calibre_db.get_filtered_book = lambda book_id, allow_show_archived=False: (
+        types.SimpleNamespace(id=book_id, path="A/T ({})".format(book_id),
+                              has_cover=False, title="T")
+    )
+    cps.calibre_db.get_book_format = lambda book_id, ext: (
+        ("row" if str(ext).upper() in cps.calibre_db._formats else None)
+    )
     cps.config = types.SimpleNamespace(config_uploading=True)
     cps.helper = types.ModuleType("cps.helper")
     # used by dedup.find_existing()
@@ -32,7 +42,17 @@ def install():
         Books=object, Identifiers=types.SimpleNamespace(type=None, val=None)
     )
     sys.modules["cps"] = cps
-    sys.modules["cps.editbooks"] = types.ModuleType("cps.editbooks")
+    editbooks = types.ModuleType("cps.editbooks")
+
+    def _upload_book_formats(requested_files, book, book_id, no_cover=True):
+        """Default stand-in for Calibre-Web's helper: every handed file lands."""
+        for fs in requested_files:
+            ext = fs.filename.rsplit(".", 1)[-1].upper()
+            cps.calibre_db._formats.add(ext)
+        return {}, False
+
+    editbooks.upload_book_formats = _upload_book_formats
+    sys.modules["cps.editbooks"] = editbooks
     sys.modules["cps.helper"] = cps.helper
 
     logger_mod = types.ModuleType("cps.logger")

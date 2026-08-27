@@ -106,15 +106,28 @@ def add():
     _require_permission()
     payload = request.get_json(silent=True) or {}
     fid = payload.get("flibustaId")
-    fmt = payload.get("format")
     opds_item = payload.get("item") or {}
-    if fid is None or not fmt:
+
+    # `formats` (ordered list) is the current contract; the singular `format`
+    # stays supported so older clients / scripted callers keep working.
+    raw_formats = payload.get("formats")
+    if raw_formats is None:
+        single = payload.get("format")
+        raw_formats = [single] if single else []
+    if not isinstance(raw_formats, list):
+        return jsonify({"error": "formats must be a list"}), 400
+    if fid is None or not raw_formats:
         return jsonify({"error": "flibustaId and format are required"}), 400
 
-    # Whitelist the format: it reaches the sidecar URL and the temp filename's
+    # Whitelist every format: it reaches the sidecar URL and the temp filename's
     # extension, which Calibre-Web turns into the DB format string.
-    if str(fmt).lower().lstrip(".") not in _CONTENT_TYPES:
-        return jsonify({"error": "Unsupported format"}), 400
+    formats = []
+    for raw in raw_formats:
+        norm = str(raw or "").lower().lstrip(".")
+        if norm not in _CONTENT_TYPES:
+            return jsonify({"error": "Unsupported format: {}".format(raw)}), 400
+        if norm not in formats:  # dedup, first occurrence wins the order
+            formats.append(norm)
 
     try:
         fid = int(fid)
@@ -122,36 +135,161 @@ def add():
         return jsonify({"error": "flibustaId must be a number"}), 400
 
     existing = dedup.find_existing(calibre_db, fid)
-    if existing:
-        return jsonify({"status": "already_exists", "bookId": existing,
-                        "url": url_for("web.show_book", book_id=existing)})
-
-    try:
-        content, filename = sidecar.download(fid, fmt, title=opds_item.get("title", ""))
-    except sidecar.BookNotFound:
-        return jsonify({"error": "This book/format is no longer available"}), 404
-    except sidecar.SidecarUnavailable:
-        return jsonify({"error": "Flibusta service is unavailable"}), 503
-    except sidecar.UpstreamError:
-        return jsonify({"error": "Flibusta is unreachable, try again later"}), 502
-
-    filename = _safe_filename(filename, fmt)
+    title = opds_item.get("title", "")
 
     tmp_dir = tempfile.mkdtemp(prefix="flibusta_")
-    tmp_path = os.path.join(tmp_dir, filename)
     try:
-        with open(tmp_path, "wb") as fh:
-            fh.write(content)
-        book_id = _import_into_library(tmp_path, filename, opds_item, fmt, fid)
-    except Exception as exc:  # noqa: BLE001 - session already rolled back below
-        # Never leak internal paths / SQL / exception text to the client.
-        log.error("Flibusta import failed for id %s (%s): %s", fid, fmt, str(exc))
-        return jsonify({"error": "Import failed"}), 500
+        if existing:
+            # Known book: every requested format — including the first — is an
+            # "Upload Format" style attach onto the book that is already there.
+            entries, failed = _download_formats(fid, formats, title, tmp_dir)
+            result = _attach_formats(existing, entries)
+            result["failed"] = failed + result["failed"]
+            return jsonify({"status": "already_exists", "bookId": existing,
+                            "url": url_for("web.show_book", book_id=existing),
+                            "formats": _ordered(result, formats)})
+
+        primary = formats[0]
+        try:
+            content, filename = sidecar.download(fid, primary, title=title)
+        except sidecar.BookNotFound:
+            return jsonify({"error": "This book/format is no longer available"}), 404
+        except sidecar.SidecarUnavailable:
+            return jsonify({"error": "Flibusta service is unavailable"}), 503
+        except sidecar.UpstreamError:
+            return jsonify({"error": "Flibusta is unreachable, try again later"}), 502
+
+        filename = _safe_filename(filename, primary)
+        tmp_path = os.path.join(tmp_dir, filename)
+        # Secondary downloads happen before the import so a dead secondary is a
+        # per-format "failed" entry, never a reason to skip the primary import.
+        entries, failed = _download_formats(fid, formats[1:], title, tmp_dir)
+
+        try:
+            with open(tmp_path, "wb") as fh:
+                fh.write(content)
+            book_id = _import_into_library(tmp_path, filename, opds_item, primary, fid)
+        except Exception as exc:  # noqa: BLE001 - session already rolled back below
+            # Never leak internal paths / SQL / exception text to the client.
+            log.error("Flibusta import failed for id %s (%s): %s", fid, primary, str(exc))
+            return jsonify({"error": "Import failed"}), 500
+
+        result = _attach_formats(book_id, entries)
+        result["added"].append(primary)
+        result["failed"] = failed + result["failed"]
+        return jsonify({"status": "added", "bookId": book_id,
+                        "url": url_for("web.show_book", book_id=book_id),
+                        "formats": _ordered(result, formats)})
     finally:
         _safe_rmtree(tmp_dir)
 
-    return jsonify({"status": "added", "bookId": book_id,
-                    "url": url_for("web.show_book", book_id=book_id)})
+
+def _ordered(result, formats):
+    """Re-emit the added/skipped/failed buckets in the requested format order."""
+    return {key: [f for f in formats if f in set(result.get(key) or [])]
+            for key in ("added", "skipped", "failed")}
+
+
+def _download_formats(fid, formats, title, tmp_dir):
+    """Download each format into its own file under `tmp_dir`.
+
+    Returns `(entries, failed)` where entries are `(tmp_path, filename, fmt)`
+    tuples. A download failure here is never fatal — the caller reports the
+    format as failed and keeps going.
+    """
+    entries, failed = [], []
+    for fmt in formats:
+        try:
+            content, filename = sidecar.download(fid, fmt, title=title)
+        except sidecar.SidecarError as exc:
+            log.info("Flibusta: format %s unavailable for id %s (%s)", fmt, fid, exc)
+            failed.append(fmt)
+            continue
+        filename = _safe_filename(filename, fmt)
+        # Distinct sub-dir: two formats can legitimately share a filename.
+        sub = os.path.join(tmp_dir, fmt)
+        try:
+            os.makedirs(sub, exist_ok=True)
+            path = os.path.join(sub, filename)
+            with open(path, "wb") as fh:
+                fh.write(content)
+        except OSError as exc:
+            log.error("Flibusta: could not stage format %s for id %s: %s", fmt, fid, exc)
+            failed.append(fmt)
+            continue
+        entries.append((path, filename, fmt))
+    return entries, failed
+
+
+def _attach_formats(book_id, entries):
+    """Attach already-downloaded files to an existing book.
+
+    Mirrors Calibre-Web's "Upload Format" button by calling the very helper that
+    backs it (`cps.editbooks.upload_book_formats`, verbatim in README section 3)
+    so the file lands in the book's own directory and a `data` row is created.
+
+    `entries` are `(tmp_path, filename, fmt)` tuples. Returns
+    `{"added": [...], "skipped": [...], "failed": [...]}`.
+    """
+    result = {"added": [], "skipped": [], "failed": []}
+    if not entries:
+        return result
+
+    from werkzeug.datastructures import FileStorage
+
+    from cps.editbooks import upload_book_formats
+
+    book = calibre_db.get_filtered_book(book_id, allow_show_archived=True)
+    if book is None:
+        log.error("Flibusta: book %s vanished before formats could be attached", book_id)
+        result["failed"] = [fmt for _, _, fmt in entries]
+        return result
+
+    # Snapshot BEFORE the upload: upload_book_formats logs-and-skips a format the
+    # book already carries, and afterwards we cannot tell "was already there"
+    # from "we just added it".
+    pending, handles, files = [], [], []
+    for tmp_path, filename, fmt in entries:
+        if calibre_db.get_book_format(book_id, fmt.upper()):
+            result["skipped"].append(fmt)
+            continue
+        try:
+            fh = open(tmp_path, "rb")
+        except OSError:
+            result["failed"].append(fmt)
+            continue
+        handles.append(fh)
+        files.append(FileStorage(
+            stream=fh,
+            filename=_safe_filename(filename, fmt),
+            content_type=_CONTENT_TYPES.get(fmt, "application/octet-stream"),
+        ))
+        pending.append(fmt)
+
+    if not files:
+        return result
+
+    try:
+        upload_book_formats(files, book, book_id, getattr(book, "has_cover", False))
+        # `error` is a global "at least one file failed" flag and does not say
+        # which — so the per-format verdict comes from re-querying instead.
+        calibre_db.session.commit()
+    except Exception as exc:  # noqa: BLE001 - one bad format must not 500 the add
+        log.error("Flibusta: attaching formats to book %s failed: %s", book_id, str(exc))
+        with contextlib.suppress(Exception):
+            calibre_db.session.rollback()
+    finally:
+        for fh in handles:
+            with contextlib.suppress(Exception):
+                fh.close()
+
+    for fmt in pending:
+        try:
+            present = bool(calibre_db.get_book_format(book_id, fmt.upper()))
+        except Exception:  # noqa: BLE001
+            present = False
+        (result["added"] if present else result["failed"]).append(fmt)
+    return result
 
 
 def _safe_filename(filename, fmt):

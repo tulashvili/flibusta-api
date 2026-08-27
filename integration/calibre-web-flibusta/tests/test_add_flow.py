@@ -23,6 +23,8 @@ def test_add_returns_already_exists(app, monkeypatch):
     from cps_flibusta import views
 
     monkeypatch.setattr(views.dedup, "find_existing", lambda db, fid: 7)
+    # a known book still runs the attach path, so the download must be stubbed
+    monkeypatch.setattr(views.sidecar, "download", lambda fid, fmt, title="": (b"d", "b.fb2"))
     resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "format": "fb2"})
     assert resp.status_code == 200
     body = resp.get_json()
@@ -98,7 +100,11 @@ def test_add_success_imports_and_returns_url(app, monkeypatch):
         json={"flibustaId": "1", "format": "fb2", "item": {"title": "T"}},
     )
     assert resp.status_code == 200
-    assert resp.get_json() == {"status": "added", "bookId": 12, "url": "/book/12"}
+    body = resp.get_json()
+    assert body["status"] == "added"
+    assert body["bookId"] == 12
+    assert body["url"] == "/book/12"
+    assert body["formats"]["added"] == ["fb2"]
     assert captured["filename"] == "book.fb2"
     assert captured["content"] == b"data"
     assert captured["flibusta_id"] == 1
@@ -548,3 +554,134 @@ def test_add_import_failure_hides_exception_detail(app, monkeypatch):
     assert resp.get_json() == {"error": "Import failed"}
     assert "detail" not in resp.get_json()
     assert any("secret" in str(entry) for entry in logged)
+
+
+# --- multi-format add -----------------------------------------------------
+
+
+@pytest.fixture
+def multi(monkeypatch):
+    """Reset the multi-format stub state and give tests a wiring handle."""
+    import sys
+    import types
+
+    from cps_flibusta import views
+    from tests import _cps_stubs  # noqa: F401  (already installed by conftest)
+
+    views.calibre_db._formats = set()
+    editbooks = sys.modules["cps.editbooks"]
+
+    def default_upload(requested_files, book, book_id, no_cover=True):
+        for fs in requested_files:
+            views.calibre_db._formats.add(fs.filename.rsplit(".", 1)[-1].upper())
+        return {}, False
+
+    editbooks.upload_book_formats = default_upload
+
+    downloads = []
+    monkeypatch.setattr(
+        views.sidecar, "download",
+        lambda fid, fmt, title="": (downloads.append(fmt), (b"data-" + fmt.encode(),
+                                                            "book." + fmt))[1])
+    imported = []
+
+    def fake_import(tmp_path, filename, opds_item, fmt, flibusta_id):
+        imported.append(fmt)
+        views.calibre_db._formats.add(fmt.upper())
+        return 12
+
+    monkeypatch.setattr(views, "_import_into_library", fake_import)
+    monkeypatch.setattr(views.dedup, "find_existing", lambda db, fid: None)
+    return types.SimpleNamespace(downloads=downloads, imported=imported,
+                                 editbooks=editbooks, views=views)
+
+
+def test_add_multiple_formats_happy_path(app, multi):
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "added"
+    assert body["bookId"] == 12
+    assert multi.imported == ["fb2"], "primary must import exactly once"
+    assert body["formats"]["added"] == ["fb2", "mobi"]
+    assert body["formats"]["skipped"] == []
+    assert body["formats"]["failed"] == []
+
+
+def test_add_multiple_formats_secondary_attach_failure(app, multi):
+    multi.editbooks.upload_book_formats = lambda files, book, bid, no_cover=True: ({}, True)
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["bookId"] == 12, "the primary book must survive a secondary failure"
+    assert body["formats"]["added"] == ["fb2"]
+    assert body["formats"]["failed"] == ["mobi"]
+
+
+def test_add_multiple_formats_skips_existing_format(app, multi):
+    multi.views.calibre_db._formats.add("MOBI")
+    called = []
+    multi.editbooks.upload_book_formats = lambda files, book, bid, no_cover=True: (
+        called.append([f.filename for f in files]), ({}, False))[1]
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["formats"]["skipped"] == ["mobi"]
+    assert body["formats"]["added"] == ["fb2"]
+    assert body["formats"]["failed"] == []
+    assert called == [] or called == [[]], "an already-present format must not be re-uploaded"
+
+
+def test_add_existing_book_attaches_all_formats(app, multi, monkeypatch):
+    monkeypatch.setattr(multi.views.dedup, "find_existing", lambda db, fid: 7)
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "epub"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "already_exists"
+    assert body["bookId"] == 7
+    assert multi.imported == [], "_import_into_library must not run for a known book"
+    assert body["formats"]["added"] == ["fb2", "epub"]
+
+
+def test_add_secondary_download_failure_is_reported(app, multi, monkeypatch):
+    from cps_flibusta import views
+
+    def flaky(fid, fmt, title=""):
+        if fmt == "mobi":
+            raise views.sidecar.BookNotFound("gone")
+        return (b"data", "book." + fmt)
+
+    monkeypatch.setattr(views.sidecar, "download", flaky)
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "added"
+    assert body["formats"]["added"] == ["fb2"]
+    assert body["formats"]["failed"] == ["mobi"]
+
+
+def test_add_singular_format_still_supported(app, multi):
+    resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "format": "fb2"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "added"
+    assert body["formats"]["added"] == ["fb2"]
+
+
+def test_add_rejects_a_bad_format_inside_the_list(app, multi):
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "exe"]})
+    assert resp.status_code == 400
+    assert "exe" in resp.get_json()["error"]
+    assert multi.downloads == [], "nothing may be downloaded when validation fails"
+
+
+def test_add_rejects_an_empty_formats_list(app, multi):
+    resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "formats": []})
+    assert resp.status_code == 400
+    assert multi.downloads == []
