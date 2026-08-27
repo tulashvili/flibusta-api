@@ -248,17 +248,21 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
             helper.add_book_to_thumbnail_cache(book_id)
         return book_id
     except Exception:
-        calibre_db.session.rollback()
         # Spec step 8: the DB rollback alone leaves the on-disk directory that
         # update_dir_structure / move_coverfile may already have created.
-        # Resolve the path HERE, not earlier: create_book_on_upload sets an
-        # id-less `<author>/<title>`, and update_dir_structure then renames the
-        # dir to `<author>/<title> (<id>)` and rewrites db_book.path. A snapshot
-        # taken before that rename would point at a path that no longer exists.
-        if db_book is not None:
-            book_dir = _library_book_dir(db_book)
-            if book_dir:
-                _safe_rmtree(book_dir)
+        #
+        # Order matters in both directions here:
+        # * not earlier than this block — create_book_on_upload sets an id-less
+        #   `<author>/<title>`, and update_dir_structure then renames the dir to
+        #   `<author>/<title> (<id>)` and rewrites db_book.path, so a snapshot
+        #   taken inside the try would point at a path that no longer exists;
+        # * not after the rollback — rollback() expires/detaches instances, so
+        #   reading db_book.path past that point can raise DetachedInstanceError
+        #   and mask the original exception. db_book is still live right here.
+        book_dir = _library_book_dir(db_book) if db_book is not None else None
+        calibre_db.session.rollback()
+        if book_dir is not None:
+            _safe_rmtree(book_dir)
         raise
 
 
