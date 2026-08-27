@@ -1,3 +1,162 @@
+# Calibre-Web ↔ Flibusta integration
+
+Add books from [Flibusta](http://flibusta.is) to a self-hosted
+[Calibre-Web](https://github.com/janeczku/calibre-web) library from a search page
+inside Calibre-Web itself. Search Flibusta, pick a format, and the book is downloaded,
+unpacked, and imported into your Calibre library through Calibre-Web's own upload
+pipeline (metadata, cover, identifier, dir structure).
+
+## Architecture
+
+```
+                    docker compose network
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  ┌───────────────────────────┐      ┌─────────────────────┐  │
+  │  │ calibre-web  (:8083)      │      │ flibusta-sidecar    │  │
+  │  │                           │      │  (:8080, internal)  │  │
+  │  │  cps/  (pinned 0.6.27)    │      │                     │  │
+  │  │   + cps/flibusta/  ◄──────┼──────┼─ Node/Express wrap  │  │
+  │  │     (blueprint)   HTTP    │      │  around `flibusta`  │  │
+  │  │     /flibusta/index       │      │  npm package        │  │
+  │  │     /flibusta/search      │      │  /health /search    │  │
+  │  │     /flibusta/cover/<id>  │      │  /cover  /download  │  │
+  │  │     /flibusta/add  ───────┼─┐    │                     │  │
+  │  │                           │ │    └──────────┬──────────┘  │
+  │  │  reuses editbooks.py:     │ │               │ OPDS/HTTP   │
+  │  │   file_handling_on_upload │ │               ▼             │
+  │  │   create_book_on_upload   │ │        flibusta.is (public) │
+  │  │   update_dir_structure    │ │                             │
+  │  │   move_coverfile          │ │                             │
+  │  └───────────┬───────────────┘ │                             │
+  │              │ writes          │ POST fb2/epub bytes         │
+  │              ▼                 │ + OPDS metadata             │
+  │        /books  (Calibre library, bind mount)                 │
+  │         metadata.db + <author>/<title>/…                     │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+- **Sidecar** (`sidecar/`) — a small Node/Express service wrapping the `flibusta`
+  npm package. Normalizes OPDS results to a stable JSON contract, unpacks
+  `application/fb2+zip` to raw `.fb2`, passes `epub` through, and transliterates the
+  `Content-Disposition` filename. Not exposed on the host — only the calibre-web
+  container talks to it.
+- **Blueprint** (`cps_flibusta/`, deployed as `cps/flibusta/`) — Flask blueprint
+  registered into Calibre-Web via patch `0001`. Renders a search page in the
+  Calibre-Web theme, proxies search/cover through the sidecar, and on *add* feeds the
+  downloaded bytes into Calibre-Web's stock upload helpers. Dedup and the OPDS
+  metadata enrichment key on a `flibusta:<id>` identifier.
+- **Two pinned core patches** (`patches/`) — `cps/main.py` (blueprint registration)
+  and `cps/templates/layout.html` (a "Download Books" nav item). Generated against the
+  exact pinned digest; see "Updating the pinned Calibre-Web release" below.
+
+## Prerequisites
+
+- Docker + Docker Compose v2 (`docker compose`, not `docker-compose`).
+- A **pre-seeded Calibre library**. The linuxserver Calibre-Web image ships **no
+  `calibredb`**, and Calibre-Web never creates a library on its own — a valid
+  `metadata.db` must already exist at `/books` inside the container
+  (`./data/books` on the host). Options:
+  - Copy an existing Calibre library folder into `./data/books` (must contain
+    `metadata.db`).
+  - Create one with desktop [Calibre](https://calibre-ebook.com/) /
+    `calibredb --with-library ./data/books add_empty`.
+  - Use Calibre-Web's **Admin → Database Configuration** ("Add new books database
+    location") to point at a folder that already has a `metadata.db`. See the
+    [Calibre-Web wiki](https://github.com/janeczku/calibre-web/wiki).
+  - If you hand-build the schema, `books.series_index` **must** have `REAL` affinity
+    (with `VARCHAR` the stock book-edit page 500s in `cps/jinjia.py:formatfloat`).
+
+## Running
+
+```bash
+cd integration/calibre-web-flibusta
+docker compose build
+docker compose up -d
+# http://localhost:8083
+```
+
+`./data/config` and `./data/books` are git-ignored bind mounts.
+
+## First run
+
+1. Log in as `admin` / `admin123` and change the password.
+2. **Admin → Database Configuration** — point it at `/books`. The folder must already
+   contain a valid `metadata.db` (see Prerequisites); Calibre-Web will not create one.
+3. **Admin → Basic Configuration → Uploading** — tick *Enable Uploads* and make sure
+   `fb2` (and `epub`) are in the allowed upload formats.
+4. **Verify the upload toggle persisted.** Re-open Admin → Basic Configuration →
+   Uploading and confirm *Enable Uploads* is still ticked (in one scripted run
+   `POST /admin/ajaxconfig` did not persist `config_uploading` to `app.db`; toggling
+   it in the UI works normally). Without it, `/flibusta/` returns **403** — the
+   blueprint gates on `config.config_uploading` and `current_user.role_upload()`.
+5. "Download Books" now appears in the top navbar. Search, pick a format, add.
+
+## The `flibusta:<id>` identifier convention
+
+Every imported book gets a Calibre identifier `flibusta:<flibustaId>` (visible on the
+book's admin page as `identifier-val-flibusta`). It is the dedup key: re-searching a
+book already in the library reports `alreadyInLibrary=true` with its `bookId`, and a
+repeat `/flibusta/add` returns `{"status":"already_exists"}` instead of a duplicate.
+The OPDS metadata enrichment is fill-only-if-empty and also keyed on this identifier.
+
+## Running the tests locally
+
+**Blueprint (Python):** deps are pinned in `requirements-dev.txt`. The suite stubs
+`cps.*` (see `tests/_cps_stubs.py`), so Calibre-Web itself is not required.
+
+```bash
+cd integration/calibre-web-flibusta
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests -q      # ~45 passing
+```
+
+**Sidecar (Node):**
+
+```bash
+cd integration/calibre-web-flibusta/sidecar
+npm install
+npm test                                  # ~17 passing (mocha + nock)
+```
+
+CI runs both on any change under `integration/calibre-web-flibusta/**`
+(`.github/workflows/calibre-web-flibusta.yml`).
+
+## Updating the pinned Calibre-Web release
+
+The two core patches carry context lines from a specific Calibre-Web release, so they
+must be regenerated whenever the pinned digest changes.
+
+1. **Pick the new digest.**
+   ```bash
+   docker pull lscr.io/linuxserver/calibre-web:latest
+   docker inspect --format='{{index .RepoDigests 0}}' lscr.io/linuxserver/calibre-web:latest
+   ```
+   Update the `FROM …@sha256:…` line in `Dockerfile` and §1 of this README (also note
+   the human version from `cps/constants.py` → `STABLE_VERSION`).
+2. **Re-extract the two upstream files** from the new image:
+   ```bash
+   IMG=lscr.io/linuxserver/calibre-web@sha256:<new>
+   docker run --rm --entrypoint sh "$IMG" -c 'cat /app/calibre-web/cps/main.py' > /tmp/main.py
+   docker run --rm --entrypoint sh "$IMG" -c 'cat /app/calibre-web/cps/templates/layout.html' > /tmp/layout.html
+   ```
+3. **Re-apply the edits by hand** (blueprint import + `register_blueprint` in
+   `main.py`; the "Download Books" `<li>` inside the
+   `{% if current_user.role_upload() and g.allow_upload %}` guard in `layout.html`)
+   and **regenerate both patches** with `diff -u` original vs edited, saving to
+   `patches/0001-register-flibusta-blueprint.patch` and
+   `patches/0002-nav-menu-item.patch`.
+4. **Re-check the upstream signatures** used by `cps_flibusta/` (`file_handling_on_upload`,
+   `create_book_on_upload`, `update_dir_structure`, `move_coverfile`, `BookMeta` field
+   order). Update §3–§9 of this README if anything changed. Do NOT change `cps_flibusta/`
+   here unless a signature actually moved (that is its own task).
+5. **Re-run the suites** — `pytest tests -q` and `sidecar && npm test`.
+6. **Re-run the in-container smoke** (see "Smoke test results" below) against freshly
+   built containers.
+7. **Rebuild** — `docker compose build --no-cache && docker compose up -d`.
+
+---
+
 # Calibre-Web — pinned release & upload internals
 
 Task 6 (RESEARCH/PIN). All facts below were extracted from the actual pinned image on
