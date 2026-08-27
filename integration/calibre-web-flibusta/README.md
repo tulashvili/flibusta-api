@@ -968,6 +968,23 @@ a book whose `has_cover` is still 0 the extracted cover is left beside the file 
 `<bookfolder>.mobi.jpg`. That is stock Calibre-Web behaviour (the book-edit page passes
 the same argument), not something the blueprint adds.
 
+### Review fix round (2026-08-27)
+
+| # | Check | Result |
+|---|---|---|
+| 13 | Import `327641` as `fb2` only, then re-POST `formats:["fb2","mobi"]` | **PASS** — `already_exists`, `{"added":["mobi"],"skipped":["fb2"],"failed":[]}`; only `mobi` reached the sidecar |
+| 14 | Same request with the **sidecar container stopped**, both formats now present | **PASS** — `200 {"added":[],"skipped":["fb2","mobi"],"failed":[]}`. A book whose formats are all present needs no sidecar at all — proof that nothing is re-downloaded |
+| 15 | Control for 14: `formats:["fb2","epub"]`, sidecar still stopped | **PASS** — `{"skipped":["fb2"],"failed":["epub"]}`; the genuinely missing format is the only one that tries to download |
+
+Book 6's folder holds `Крестный отец - Марио Пьюзо.fb2` (from the import) and
+`Крестный отец (6).mobi` (from the attach) — no second `.fb2`, so the present format was
+never re-fetched or re-saved.
+
+`/add` also rejects a format the server itself has disabled
+(`400 {"error": "Format mobi is not enabled on this Calibre-Web server"}`) by checking
+`config.config_upload_formats` up front, instead of letting it fail inside
+`upload_book_formats` after a wasted download. An empty/unset setting means "allow all".
+
 ### Known issues found while smoking
 
 * **Tag splitting.** `metadata.enrich` joins categories with `","`, and Calibre-Web splits

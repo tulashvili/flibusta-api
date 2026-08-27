@@ -40,7 +40,7 @@
       return '<label class="flibusta-fmt"><input type="checkbox" value="' + esc(name) +
         '"> ' + esc(name.toUpperCase()) +
         '<span class="flibusta-primary-badge" style="display:none"> ' +
-        esc(t.primary || 'основной') + '</span></label>';
+        esc(t.primary || 'primary') + '</span></label>';
     }).join('');
     var authors = (item.authors || []).map(function (a) {
       return a && a.name ? a.name : a;
@@ -103,8 +103,8 @@
       });
     }
     chunk(f.added, 'flibusta-ok', '');
-    chunk(f.skipped, 'flibusta-skip', t.alreadyThere || 'уже есть');
-    chunk(f.failed, 'flibusta-fail', t.notAdded || 'не удалось');
+    chunk(f.skipped, 'flibusta-skip', t.alreadyThere || 'already present');
+    chunk(f.failed, 'flibusta-fail', t.notAdded || 'failed');
     return parts.join(' ');
   }
 
@@ -130,6 +130,12 @@
           if (report) {
             report.innerHTML = formatReport(res.j);
             report.style.display = 'block';
+          }
+          // The button is gone; leaving the checkboxes live would let the user
+          // re-tick formats with nothing to submit them.
+          if (el) {
+            [].slice.call(el.querySelectorAll('.flibusta-formats input'))
+              .forEach(function (input) { input.disabled = true; });
           }
           var got = ((res.j.formats || {}).added || []).concat(
             (res.j.formats || {}).skipped || []);

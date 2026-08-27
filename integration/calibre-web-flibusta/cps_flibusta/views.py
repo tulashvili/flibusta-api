@@ -129,6 +129,17 @@ def add():
         if norm not in formats:  # dedup, first occurrence wins the order
             formats.append(norm)
 
+    # A format Calibre-Web itself refuses would only fail deep inside
+    # upload_book_formats / file_handling_on_upload, after a pointless download
+    # and with no reason the user can act on. Reject it up front instead.
+    allowed = _configured_upload_formats()
+    if allowed is not None:
+        for fmt in formats:
+            if fmt not in allowed:
+                return jsonify({
+                    "error": "Format {} is not enabled on this Calibre-Web "
+                             "server".format(fmt)}), 400
+
     try:
         fid = int(fid)
     except (TypeError, ValueError):
@@ -142,9 +153,18 @@ def add():
         if existing:
             # Known book: every requested format — including the first — is an
             # "Upload Format" style attach onto the book that is already there.
-            entries, failed = _download_formats(fid, formats, title, tmp_dir)
-            result = _attach_formats(existing, entries)
-            result["failed"] = failed + result["failed"]
+            # Check what the book already carries BEFORE downloading anything:
+            # re-fetching a format that is already on the shelf is pure waste
+            # (and the common case, since the card offers the same list again).
+            present = _present_formats(existing, formats)
+            missing = [f for f in formats if f not in present]
+            result = {"added": [], "skipped": list(present), "failed": []}
+            if missing:
+                entries, failed = _download_formats(fid, missing, title, tmp_dir)
+                attached = _attach_formats(existing, entries)
+                result["added"] = attached["added"]
+                result["skipped"] += attached["skipped"]
+                result["failed"] = failed + attached["failed"]
             return jsonify({"status": "already_exists", "bookId": existing,
                             "url": url_for("web.show_book", book_id=existing),
                             "formats": _ordered(result, formats)})
@@ -161,13 +181,21 @@ def add():
 
         filename = _safe_filename(filename, primary)
         tmp_path = os.path.join(tmp_dir, filename)
+        # Land the primary bytes on disk right away — holding a whole book in
+        # memory across the secondary fetches serves no purpose.
+        try:
+            with open(tmp_path, "wb") as fh:
+                fh.write(content)
+        except OSError as exc:
+            log.error("Flibusta: could not stage format %s for id %s: %s", primary, fid, exc)
+            return jsonify({"error": "Import failed"}), 500
+        content = None
+
         # Secondary downloads happen before the import so a dead secondary is a
         # per-format "failed" entry, never a reason to skip the primary import.
         entries, failed = _download_formats(fid, formats[1:], title, tmp_dir)
 
         try:
-            with open(tmp_path, "wb") as fh:
-                fh.write(content)
             book_id = _import_into_library(tmp_path, filename, opds_item, primary, fid)
         except Exception as exc:  # noqa: BLE001 - session already rolled back below
             # Never leak internal paths / SQL / exception text to the client.
@@ -182,6 +210,32 @@ def add():
                         "formats": _ordered(result, formats)})
     finally:
         _safe_rmtree(tmp_dir)
+
+
+def _configured_upload_formats():
+    """The server's allowed upload extensions as a set, or None for "no limit".
+
+    Calibre-Web stores this as a comma-separated string; an empty/unset value
+    means every extension is accepted.
+    """
+    raw = getattr(config, "config_upload_formats", None)
+    if not raw:
+        return None
+    allowed = {part.strip().lower().lstrip(".") for part in str(raw).split(",")}
+    allowed.discard("")
+    return allowed or None
+
+
+def _present_formats(book_id, formats):
+    """Which of `formats` the book already carries (order preserved)."""
+    present = []
+    for fmt in formats:
+        try:
+            if calibre_db.get_book_format(book_id, fmt.upper()):
+                present.append(fmt)
+        except Exception as exc:  # noqa: BLE001 - a lookup failure just means "unknown"
+            log.info("Flibusta: format lookup failed for book %s (%s): %s", book_id, fmt, exc)
+    return present
 
 
 def _ordered(result, formats):

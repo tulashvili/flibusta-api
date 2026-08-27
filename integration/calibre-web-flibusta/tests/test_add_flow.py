@@ -105,6 +105,7 @@ def test_add_success_imports_and_returns_url(app, monkeypatch):
     assert body["bookId"] == 12
     assert body["url"] == "/book/12"
     assert body["formats"]["added"] == ["fb2"]
+    assert set(body) == {"status", "bookId", "url", "formats"}
     assert captured["filename"] == "book.fb2"
     assert captured["content"] == b"data"
     assert captured["flibusta_id"] == 1
@@ -632,7 +633,7 @@ def test_add_multiple_formats_skips_existing_format(app, multi):
     assert body["formats"]["skipped"] == ["mobi"]
     assert body["formats"]["added"] == ["fb2"]
     assert body["formats"]["failed"] == []
-    assert called == [] or called == [[]], "an already-present format must not be re-uploaded"
+    assert called == [], "an already-present format must not be re-uploaded"
 
 
 def test_add_existing_book_attaches_all_formats(app, multi, monkeypatch):
@@ -685,3 +686,89 @@ def test_add_rejects_an_empty_formats_list(app, multi):
     resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "formats": []})
     assert resp.status_code == 400
     assert multi.downloads == []
+
+
+def test_add_existing_book_does_not_redownload_present_formats(app, multi, monkeypatch):
+    """Fix #1: a dedup hit must not re-fetch what the book already carries."""
+    monkeypatch.setattr(multi.views.dedup, "find_existing", lambda db, fid: 7)
+    multi.views.calibre_db._formats.update({"FB2", "MOBI"})
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "already_exists"
+    assert body["formats"] == {"added": [], "skipped": ["fb2", "mobi"], "failed": []}
+    assert multi.downloads == [], "nothing may be downloaded when both formats are present"
+
+
+def test_add_existing_book_downloads_only_the_missing_format(app, multi, monkeypatch):
+    """Fix #1: the missing format is still fetched and attached."""
+    monkeypatch.setattr(multi.views.dedup, "find_existing", lambda db, fid: 7)
+    multi.views.calibre_db._formats.add("FB2")
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    assert resp.get_json()["formats"] == {"added": ["mobi"], "skipped": ["fb2"], "failed": []}
+    assert multi.downloads == ["mobi"]
+
+
+def test_add_rejects_a_format_disabled_in_the_server_config(app, multi):
+    """Fix #2: config_upload_formats is checked before anything is downloaded."""
+    multi.views.config.config_upload_formats = "fb2,epub"
+    try:
+        resp = app.test_client().post(
+            "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+        assert resp.status_code == 400
+        assert "mobi" in resp.get_json()["error"]
+        assert multi.downloads == []
+        # an empty/unset setting means "everything allowed"
+        multi.views.config.config_upload_formats = ""
+        ok = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "formats": ["mobi"]})
+        assert ok.status_code == 200
+    finally:
+        multi.views.config.config_upload_formats = ""
+
+
+def test_add_reports_all_failed_when_the_book_vanishes(app, multi):
+    """Fix #7: get_filtered_book returning None must not raise."""
+    multi.views.calibre_db.get_filtered_book = lambda bid, allow_show_archived=False: None
+    try:
+        resp = app.test_client().post(
+            "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["bookId"] == 12
+        assert body["formats"]["failed"] == ["mobi"]
+        assert body["formats"]["added"] == ["fb2"]
+    finally:
+        import types
+        multi.views.calibre_db.get_filtered_book = (
+            lambda bid, allow_show_archived=False: types.SimpleNamespace(
+                id=bid, path="A/T ({})".format(bid), has_cover=False, title="T"))
+
+
+def test_add_rejects_a_non_list_formats_value(app, multi):
+    """Fix #7: `formats` must be a list; the singular `format` string stays valid."""
+    resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "formats": "fb2"})
+    assert resp.status_code == 400
+    assert multi.downloads == []
+    ok = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "format": "fb2"})
+    assert ok.status_code == 200
+
+
+def test_add_cleans_the_temp_dir_after_a_partial_failure(app, multi):
+    """Fix #7: a secondary-attach failure must still leave no temp dir behind."""
+    seen = {}
+
+    def fake_import(tmp_path, filename, opds_item, fmt, flibusta_id):
+        seen["dir"] = os.path.dirname(tmp_path)
+        multi.views.calibre_db._formats.add(fmt.upper())
+        return 12
+
+    multi.views._import_into_library = fake_import
+    multi.editbooks.upload_book_formats = lambda files, book, bid, no_cover=True: ({}, True)
+    resp = app.test_client().post(
+        "/flibusta/add", json={"flibustaId": 1, "formats": ["fb2", "mobi"]})
+    assert resp.status_code == 200
+    assert resp.get_json()["formats"]["failed"] == ["mobi"]
+    assert seen["dir"] and not os.path.exists(seen["dir"])
