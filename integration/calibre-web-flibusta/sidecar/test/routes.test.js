@@ -99,12 +99,32 @@ describe('sidecar routes', () => {
     server.close();
   });
 
+  it('GET /download rejects a format outside the whitelist with 400', async () => {
+    let called = false;
+    const client = { fetchBook: async () => { called = true; return Buffer.from('x'); } };
+    const { server, port } = await startServer(client);
+    const res = await get(port, '/download/1/..%2F..%2Fetc%2Fpasswd');
+    expect(res.status).to.equal(400);
+    expect(called).to.equal(false);
+    server.close();
+  });
+
   it('GET /download sets a Content-Disposition header', async () => {
     const client = { fetchBook: async () => Buffer.from('<?xml version="1.0"?><FictionBook/>') };
     const { server, port } = await startServer(client);
     const res = await get(port, '/download/1/fb2?title=My%20Book');
     expect(res.status).to.equal(200);
     expect(res.headers['content-disposition']).to.match(/attachment; filename="My Book\.fb2"/);
+    server.close();
+  });
+
+  it('substitutes non-ASCII in the download filename (asciiFilename, not translit)', async () => {
+    const client = { fetchBook: async () => Buffer.from('<?xml version="1.0"?><FictionBook/>') };
+    const { server, port } = await startServer(client);
+    const res = await get(port, `/download/1/fb2?title=${encodeURIComponent('Богатый папа')}`);
+    expect(res.status).to.equal(200);
+    // '_' substitution, NOT a transliteration ("Bogatyy papa")
+    expect(res.headers['content-disposition']).to.equal('attachment; filename="_______ ____.fb2"');
     server.close();
   });
 });

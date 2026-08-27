@@ -22,6 +22,8 @@ services:
       context: ./sidecar
       dockerfile: Dockerfile
     environment:
-      - FLIBUSTA_BASE_URL=http://flibusta.is/
+      - FLIBUSTA_BASE_URL=https://flibusta.is/
       - PORT=8080
+      # Optional egress proxy for networks that block Flibusta. Honored only when set.
+      # - FLIBUSTA_PROXY=http://proxy.example:3128
     restart: unless-stopped

@@ -4,10 +4,34 @@ const { mapSearchResult } = require('./mapSearchResult');
 class NotFound extends Error {}
 class UpstreamError extends Error {}
 
-const BASE_URL = process.env.FLIBUSTA_BASE_URL || 'http://flibusta.is/';
+const BASE_URL = process.env.FLIBUSTA_BASE_URL || 'https://flibusta.is/';
 const TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS || 20000);
 const RETRIES = Number(process.env.RETRY_COUNT || 1);
 const UA = process.env.USER_AGENT || 'flibusta-sidecar/0.1';
+// Hard ceiling on downloaded book/cover bytes. Flibusta is untrusted upstream:
+// without this a hostile/broken response could buffer unbounded into memory.
+// Exceeding it makes axios reject -> UpstreamError -> HTTP 502 to the caller.
+const MAX_BYTES = Number(process.env.MAX_DOWNLOAD_BYTES || 64 * 1024 * 1024);
+
+// Optional egress proxy, honored only when FLIBUSTA_PROXY is set. axios takes a
+// {protocol, host, port} object; `false` disables proxying entirely (the
+// previous unconditional behavior).
+function proxyConfig() {
+  const raw = process.env.FLIBUSTA_PROXY;
+  if (!raw) return false;
+  try {
+    const u = new URL(raw);
+    const cfg = {
+      protocol: u.protocol.replace(':', ''),
+      host: u.hostname,
+      port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80),
+    };
+    if (u.username) cfg.auth = { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password || '') };
+    return cfg;
+  } catch (err) {
+    return false;
+  }
+}
 
 function makeApi() {
   return new FlibustaAPI(BASE_URL, { timeout: TIMEOUT, headers: { 'User-Agent': UA } });
@@ -44,8 +68,10 @@ async function rawGet(pathname, responseType) {
     responseType,
     timeout: TIMEOUT,
     headers: { 'User-Agent': UA },
-    proxy: false,
+    proxy: proxyConfig(),
     maxRedirects: 5,
+    maxContentLength: MAX_BYTES,
+    maxBodyLength: MAX_BYTES,
     validateStatus: (s) => s < 500,
   }));
   if (res.status === 404) throw new NotFound(pathname);

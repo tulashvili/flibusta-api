@@ -110,6 +110,11 @@ def add():
     if fid is None or not fmt:
         return jsonify({"error": "flibustaId and format are required"}), 400
 
+    # Whitelist the format: it reaches the sidecar URL and the temp filename's
+    # extension, which Calibre-Web turns into the DB format string.
+    if str(fmt).lower().lstrip(".") not in _CONTENT_TYPES:
+        return jsonify({"error": "Unsupported format"}), 400
+
     try:
         fid = int(fid)
     except (TypeError, ValueError):
@@ -138,7 +143,9 @@ def add():
             fh.write(content)
         book_id = _import_into_library(tmp_path, filename, opds_item, fmt, fid)
     except Exception as exc:  # noqa: BLE001 - session already rolled back below
-        return jsonify({"error": "Import failed", "detail": str(exc)}), 500
+        # Never leak internal paths / SQL / exception text to the client.
+        log.error("Flibusta import failed for id %s (%s): %s", fid, fmt, str(exc))
+        return jsonify({"error": "Import failed"}), 500
     finally:
         _safe_rmtree(tmp_dir)
 
@@ -190,6 +197,7 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
         move_coverfile,
     )
 
+    book_dir = None
     try:
         modify_date = False
         # create the function for sorting... (upstream comment)
@@ -211,6 +219,13 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
             modify_date |= edit_book_comments(Markup(meta.description or "").unescape(), db_book)
 
             book_id = db_book.id
+            book_dir = _library_book_dir(db_book)
+
+            # Feed the OPDS cover into meta.cover so move_coverfile copies a real
+            # cover instead of Calibre-Web's generic one. BookMeta is immutable.
+            cover_path = _fetch_cover_file(flibusta_id, os.path.dirname(tmp_path))
+            if cover_path:
+                meta = meta._replace(cover=cover_path)
 
             # non-gdrive branch only (see docstring)
             dir_error = helper.update_dir_structure(
@@ -234,7 +249,49 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
         return book_id
     except Exception:
         calibre_db.session.rollback()
+        # Spec step 8: the DB rollback alone leaves the on-disk directory that
+        # update_dir_structure / move_coverfile may already have created.
+        if book_dir:
+            _safe_rmtree(book_dir)
         raise
+
+
+def _library_book_dir(db_book):
+    """Absolute path of the book's library directory, or None if it can't be
+    resolved / would fall outside `config.get_book_path()`."""
+    rel = getattr(db_book, "path", None)
+    if not rel:
+        return None
+    try:
+        root = os.path.realpath(config.get_book_path())
+        candidate = os.path.realpath(os.path.join(root, rel))
+    except (TypeError, ValueError, OSError):
+        return None
+    if candidate == root or not candidate.startswith(root + os.sep):
+        return None
+    return candidate
+
+
+def _fetch_cover_file(flibusta_id, dest_dir):
+    """Download the OPDS cover into `dest_dir`; return its path or None.
+
+    A missing/broken cover must never fail the import — the caller falls back to
+    Calibre-Web's generic cover.
+    """
+    try:
+        upstream = sidecar.cover_response(flibusta_id)
+        path = os.path.join(dest_dir, "cover.jpg")
+        with open(path, "wb") as fh:
+            for chunk in upstream.iter_content(chunk_size=8192):
+                if chunk:
+                    fh.write(chunk)
+        if os.path.getsize(path) == 0:
+            os.unlink(path)
+            return None
+        return path
+    except Exception as exc:  # noqa: BLE001 - cover is best-effort
+        log.info("Flibusta import: no cover for %s (%s)", flibusta_id, exc)
+        return None
 
 
 def _safe_rmtree(path):

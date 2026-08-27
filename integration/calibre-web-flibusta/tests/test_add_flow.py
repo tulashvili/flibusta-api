@@ -349,3 +349,179 @@ def test_import_logs_dir_structure_failure(app, monkeypatch, tmp_path):
     assert views._import_into_library(str(f), "book.fb2", {}, "fb2", 7) == 55
     assert logged, "update_dir_structure failure was not logged"
     assert "could not move file" in str(logged[0])
+
+
+# --- final-fix wave -------------------------------------------------------
+
+from collections import namedtuple
+
+_BookMeta = namedtuple("BookMeta", "file_path, extension, title, author, cover, description, "
+                                   "tags, series, series_id, languages, publisher, pubdate, "
+                                   "identifiers")
+
+
+def _meta(**over):
+    base = dict(file_path="/tmp/x.fb2", extension=".FB2", title="T", author="A", cover=None,
+                description="d", tags="", series="", series_id="", languages="ru",
+                publisher="", pubdate="", identifiers=[])
+    base.update(over)
+    return _BookMeta(**base)
+
+
+def _wire_editbooks(tmp_path, book_dir_name="A/T (1)", move_cover=None):
+    """Point the cps stubs at a real on-disk library rooted in tmp_path."""
+    import sys
+    import types
+
+    from cps_flibusta import views
+
+    root = tmp_path / "books"
+    book_dir = root / book_dir_name
+    book_dir.mkdir(parents=True)
+    (book_dir / "book.fb2").write_bytes(b"x")
+
+    db_book = types.SimpleNamespace(id=55, path=book_dir_name)
+    editbooks = sys.modules["cps.editbooks"]
+    editbooks.file_handling_on_upload = lambda fs: (_meta(), None)
+    editbooks.create_book_on_upload = lambda md, m: (db_book, ["A"], "T (1)")
+    editbooks.edit_book_comments = lambda c, b: False
+    editbooks.move_coverfile = move_cover or (lambda m, b: None)
+
+    helper = sys.modules["cps.helper"]
+    helper.update_dir_structure = lambda *a: None
+    helper.add_book_to_thumbnail_cache = lambda bid: None
+
+    views.calibre_db.create_functions = lambda cfg: None
+    views.calibre_db.set_metadata_dirty = lambda bid: None
+    views.calibre_db.session.commit = lambda: None
+    views.calibre_db.session.rollback = lambda: None
+    views.config.get_book_path = lambda: str(root)
+    return root, book_dir
+
+
+class _CoverUpstream:
+    headers = {"Content-Type": "image/jpeg"}
+
+    def iter_content(self, chunk_size=8192):
+        yield b"\xff\xd8\xff"
+        yield b"JPEGBYTES"
+
+
+def test_import_feeds_opds_cover_into_meta_cover(app, monkeypatch, tmp_path):
+    """Item 2: move_coverfile must see a real meta.cover, not None."""
+    from cps_flibusta import views
+    from cps_flibusta import metadata
+
+    seen = {}
+    _wire_editbooks(tmp_path, move_cover=lambda m, b: seen.update(
+        cover=m.cover, exists=bool(m.cover) and os.path.exists(m.cover),
+        size=os.path.getsize(m.cover) if m.cover and os.path.exists(m.cover) else 0))
+
+    monkeypatch.setattr(metadata, "enrich", lambda m, i, f: m)
+    monkeypatch.setattr(views.sidecar, "cover_response", lambda fid: _CoverUpstream())
+
+    f = tmp_path / "book.fb2"
+    f.write_bytes(b"x")
+    assert views._import_into_library(str(f), "book.fb2", {}, "fb2", 416925) == 55
+    assert seen["cover"], "meta.cover was not set from the OPDS cover"
+    assert seen["exists"]
+    assert seen["size"] == len(b"\xff\xd8\xffJPEGBYTES")
+    assert os.path.dirname(seen["cover"]) == str(tmp_path)
+
+
+def test_import_survives_a_missing_cover(app, monkeypatch, tmp_path):
+    """Item 2: a cover 404 must not fail the import; meta.cover stays None."""
+    from cps_flibusta import views
+    from cps_flibusta import metadata
+
+    seen = {}
+    _wire_editbooks(tmp_path, move_cover=lambda m, b: seen.update(cover=m.cover))
+
+    def boom(fid):
+        raise views.sidecar.BookNotFound("no cover")
+
+    monkeypatch.setattr(metadata, "enrich", lambda m, i, f: m)
+    monkeypatch.setattr(views.sidecar, "cover_response", boom)
+
+    f = tmp_path / "book.fb2"
+    f.write_bytes(b"x")
+    assert views._import_into_library(str(f), "book.fb2", {}, "fb2", 1) == 55
+    assert seen["cover"] is None
+
+
+def test_import_removes_library_dir_when_move_coverfile_fails(app, monkeypatch, tmp_path):
+    """Item 4 / spec step 8: rollback must clean the on-disk dir too."""
+    from cps_flibusta import views
+    from cps_flibusta import metadata
+
+    def explode(m, b):
+        raise RuntimeError("cover move failed")
+
+    root, book_dir = _wire_editbooks(tmp_path, move_cover=explode)
+
+    rolled_back = []
+    views.calibre_db.session.rollback = lambda: rolled_back.append(True)
+    monkeypatch.setattr(metadata, "enrich", lambda m, i, f: m)
+    monkeypatch.setattr(views.sidecar, "cover_response", lambda fid: _CoverUpstream())
+
+    assert book_dir.exists()
+    f = tmp_path / "book.fb2"
+    f.write_bytes(b"x")
+    with pytest.raises(RuntimeError):
+        views._import_into_library(str(f), "book.fb2", {}, "fb2", 1)
+
+    assert rolled_back == [True]
+    assert not book_dir.exists(), "library dir survived the rollback"
+    assert root.exists(), "the library root itself must never be removed"
+
+
+def test_library_book_dir_refuses_paths_outside_the_library(app, tmp_path):
+    """Item 4 guard: a hostile db_book.path must not delete anything outside /books."""
+    import types
+
+    from cps_flibusta import views
+
+    root = tmp_path / "books"
+    root.mkdir()
+    views.config.get_book_path = lambda: str(root)
+
+    assert views._library_book_dir(types.SimpleNamespace(path="../../etc")) is None
+    assert views._library_book_dir(types.SimpleNamespace(path="")) is None
+    assert views._library_book_dir(types.SimpleNamespace(path=".")) is None
+    assert views._library_book_dir(types.SimpleNamespace()) is None
+
+
+@pytest.mark.parametrize("fmt", ["exe", "../../etc/passwd", "djvu", "sh"])
+def test_add_rejects_formats_outside_the_whitelist(app, monkeypatch, fmt):
+    """Item 6: the format reaches a URL path and a filename extension."""
+    from cps_flibusta import views
+
+    called = []
+    monkeypatch.setattr(views.dedup, "find_existing", lambda db, fid: called.append("dedup"))
+    monkeypatch.setattr(views.sidecar, "download",
+                        lambda *a, **k: called.append("download") or (b"", "b"))
+    resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "format": fmt})
+    assert resp.status_code == 400
+    assert called == []
+
+
+def test_add_import_failure_hides_exception_detail(app, monkeypatch):
+    """Item 11: the client gets a generic message; the detail only goes to the log."""
+    from cps_flibusta import views
+
+    monkeypatch.setattr(views.dedup, "find_existing", lambda db, fid: None)
+    monkeypatch.setattr(views.sidecar, "download", lambda fid, fmt, title="": (b"d", "b.fb2"))
+
+    def boom(*a, **k):
+        raise RuntimeError("/books/secret/path blew up")
+
+    monkeypatch.setattr(views, "_import_into_library", boom)
+
+    logged = []
+    monkeypatch.setattr(views.log, "error", lambda *a, **k: logged.append(a))
+
+    resp = app.test_client().post("/flibusta/add", json={"flibustaId": 1, "format": "fb2"})
+    assert resp.status_code == 500
+    assert resp.get_json() == {"error": "Import failed"}
+    assert "detail" not in resp.get_json()
+    assert any("secret" in str(entry) for entry in logged)

@@ -10,8 +10,11 @@ WORKDIR /src
 COPY --from=base /app/calibre-web/cps/main.py cps/main.py
 COPY --from=base /app/calibre-web/cps/templates/layout.html cps/templates/layout.html
 COPY patches/ /tmp/flibusta-patches/
-RUN for p in /tmp/flibusta-patches/*.patch; do patch -p1 --no-backup-if-mismatch < "$p"; done \
- && rm -rf /tmp/flibusta-patches
+# `set -e` is load-bearing: without it a rejected hunk would only print to stderr
+# and the build would ship an unpatched (blueprint-less) image.
+RUN set -e; \
+    for p in /tmp/flibusta-patches/*.patch; do patch -p1 --no-backup-if-mismatch < "$p"; done; \
+    rm -rf /tmp/flibusta-patches
 
 FROM base
 # The blueprint package deploys as `cps.flibusta` (import: `from .flibusta import flibusta`).

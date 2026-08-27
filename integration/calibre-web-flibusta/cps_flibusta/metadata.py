@@ -19,6 +19,12 @@ def enrich(meta, opds_item, flibusta_id):
     if _is_empty(meta.description) and opds_item.get("description"):
         updates["description"] = opds_item["description"]
 
+    # Flibusta is a Russian-language library; OPDS carries no language field, so
+    # default rather than leave it blank. BookMeta.languages is a string
+    # (README section 5) — edit_book_languages() splits it on commas.
+    if _is_empty(getattr(meta, "languages", None)):
+        updates["languages"] = "ru"
+
     identifiers = list(meta.identifiers or [])
     if not any(k == "flibusta" for k, _ in identifiers):
         identifiers.append(("flibusta", str(flibusta_id)))

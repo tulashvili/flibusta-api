@@ -15,6 +15,49 @@ def app(monkeypatch):
     return flask_app
 
 
+@pytest.fixture
+def guarded_app():
+    """Same blueprint but with the real `_require_permission` left in place."""
+    from cps_flibusta import views
+
+    flask_app = Flask(__name__)
+    flask_app.register_blueprint(views.flibusta)
+    flask_app.config["TESTING"] = True
+    return flask_app
+
+
+def _call(client, route):
+    if route.startswith("/flibusta/add"):
+        return client.post(route, json={"flibustaId": 1, "format": "fb2"})
+    return client.get(route)
+
+
+@pytest.mark.parametrize("route", ["/flibusta/", "/flibusta/search?q=x", "/flibusta/add"])
+def test_routes_403_without_upload_role(guarded_app, monkeypatch, route):
+    from cps_flibusta import views
+
+    monkeypatch.setattr(views.current_user, "role_upload", lambda: False)
+    monkeypatch.setattr(views.config, "config_uploading", True)
+    assert _call(guarded_app.test_client(), route).status_code == 403
+
+
+@pytest.mark.parametrize("route", ["/flibusta/", "/flibusta/search?q=x", "/flibusta/add"])
+def test_routes_403_when_uploading_disabled(guarded_app, monkeypatch, route):
+    from cps_flibusta import views
+
+    monkeypatch.setattr(views.current_user, "role_upload", lambda: True)
+    monkeypatch.setattr(views.config, "config_uploading", False)
+    assert _call(guarded_app.test_client(), route).status_code == 403
+
+
+def test_routes_allowed_when_permitted(guarded_app, monkeypatch):
+    from cps_flibusta import views
+
+    monkeypatch.setattr(views.current_user, "role_upload", lambda: True)
+    monkeypatch.setattr(views.config, "config_uploading", True)
+    assert guarded_app.test_client().get("/flibusta/").status_code == 200
+
+
 def test_search_route_proxies_sidecar(app, monkeypatch):
     from cps_flibusta import views
 

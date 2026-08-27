@@ -38,9 +38,10 @@ pipeline (metadata, cover, identifier, dir structure).
 
 - **Sidecar** (`sidecar/`) — a small Node/Express service wrapping the `flibusta`
   npm package. Normalizes OPDS results to a stable JSON contract, unpacks
-  `application/fb2+zip` to raw `.fb2`, passes `epub` through, and transliterates the
-  `Content-Disposition` filename. Not exposed on the host — only the calibre-web
-  container talks to it.
+  `application/fb2+zip` to raw `.fb2`, passes `epub` through, and ASCII-sanitizes the
+  `Content-Disposition` filename (substitution, not transliteration — see
+  `asciiFilename` in `sidecar/src/routes.js`). Not exposed on the host — only the
+  calibre-web container talks to it.
 - **Blueprint** (`cps_flibusta/`, deployed as `cps/flibusta/`) — Flask blueprint
   registered into Calibre-Web via patch `0001`. Renders a search page in the
   Calibre-Web theme, proxies search/cover through the sidecar, and on *add* feeds the
@@ -108,7 +109,7 @@ The OPDS metadata enrichment is fill-only-if-empty and also keyed on this identi
 ```bash
 cd integration/calibre-web-flibusta
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest tests -q      # ~45 passing
+.venv/bin/python -m pytest tests -q      # ~63 passing
 ```
 
 **Sidecar (Node):**
@@ -116,7 +117,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```bash
 cd integration/calibre-web-flibusta/sidecar
 npm install
-npm test                                  # ~17 passing (mocha + nock)
+npm test                                  # ~19 passing (mocha + nock)
 ```
 
 CI runs both on any change under `integration/calibre-web-flibusta/**`
@@ -386,6 +387,34 @@ def file_handling_on_upload(requested_file):
         return None, make_response(jsonify(location=url_for("web.index")))
     return meta, None
 ```
+
+### `edit_book_comments(comments, book)` (used in step 6.5 of the add flow)
+
+Extracted verbatim from the pinned image (`sed -n "/def edit_book_comments/,/^def [a-z]/p"
+/app/calibre-web/cps/editbooks.py`), 2026-08-27:
+
+```python
+def edit_book_comments(comments, book):
+    if comments is not None:
+        modify_date = False
+        if comments:
+            comments = clean_string(comments, book.id)
+        if len(book.comments):
+            if book.comments[0].text != comments:
+                book.comments[0].text = comments
+                modify_date = True
+        else:
+            if comments:
+                book.comments.append(db.Comments(comment=comments, book=book.id))
+                modify_date = True
+        return modify_date
+```
+
+**It sanitizes.** Every non-empty `comments` value goes through
+`clean_string(comments, book.id)` (Calibre-Web's `clean_html` wrapper) *before* it is
+persisted, so the blueprint may keep passing the OPDS description through
+`Markup(...).unescape()` exactly as stock `upload()` does — the unescaped HTML is
+sanitized upstream, on the way into the DB. No stripping is needed on our side.
 
 ### `move_coverfile(meta, db_book)` (used in step 7 of the add flow)
 
@@ -705,6 +734,25 @@ confirmed against the pinned release". Confirmed differences:
 - **Python is 3.12.3 at `/lsiopy/bin/python3`**, site-packages writable in a derived
   image — spec's open question ("`pip install` in a derived image persists") is resolved
   YES.
+- **`edit_book_comments` sanitizes its input** — non-empty comments are run through
+  `clean_string(comments, book.id)` before they are written (verbatim body in section 3).
+  The OPDS `description` we hand it is therefore sanitized upstream; the blueprint keeps
+  stock `upload()`'s `Markup(meta.description or "").unescape()` and does no stripping of
+  its own. (Verified against the pinned digest, 2026-08-27.)
+- **OPDS covers are fed in via `meta.cover`** — `_import_into_library` downloads
+  `/cover/<id>` from the sidecar into the import temp dir and does
+  `meta = meta._replace(cover=<path>)` before `move_coverfile`, which copies it to
+  `<book_path>/cover.jpg` and unlinks the temp file. A cover 404 / stream error is
+  swallowed (logged at info) and the generic cover is used — a missing cover never fails
+  an import. This resolves the "`has_cover` stays 0" smoke-test finding below.
+- **`meta.languages` defaults to `"ru"`** — OPDS carries no language element and Flibusta
+  is a Russian-language library, so `metadata.enrich` fills a blank `languages` with
+  `"ru"` (a string; `edit_book_languages` splits it on commas). A language detected from
+  the file itself always wins.
+- **Rollback removes the on-disk directory too** — spec step 8 only says "rollback". A
+  failure after `create_book_on_upload` can leave `<book_path>/<author>/<title>` behind,
+  so the `except` branch also `shutil.rmtree`s the directory resolved from
+  `db_book.path`, guarded to paths strictly under `config.get_book_path()`.
 - **`create_book_on_upload` calls `db.Data(db_book, meta.extension.upper()[1:], ...)`** —
   so the DB format string is derived from `meta.extension`; the temp filename's extension
   is load-bearing for the format recorded in Calibre.
@@ -728,7 +776,33 @@ so their context lines match the pinned release by construction.
 
 The base image has **no `patch` binary**, so the Dockerfile applies the patches in a
 throwaway `alpine` stage (which `apk add patch`) and copies the two patched files into the
-final image. `requests` 2.34.2 is already present (§8) — nothing is pip-installed.
+final image. That `RUN` starts with `set -e`, so a hunk that no longer applies (e.g. after
+a digest bump) **fails the build** instead of silently producing an unpatched image.
+`requests` 2.34.2 is already present (§8) — nothing is pip-installed.
+
+### Sidecar environment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `FLIBUSTA_BASE_URL` | `https://flibusta.is/` | **https by default.** Verified 2026-08-27 against live Flibusta: OPDS search, `/b/416925/fb2` (654 839 bytes) and `/i/25/416925/cover.jpg` all return `200` over https, so no downgrade to http is needed. |
+| `FLIBUSTA_PROXY` | *(unset)* | Optional egress proxy (`http://host:port`, credentials in the URL supported). **Honored only when set**; when unset axios runs with `proxy: false`, i.e. env proxies are ignored — the previous behavior. Commented-out placeholder in `docker-compose.yml`. |
+| `MAX_DOWNLOAD_BYTES` | `67108864` (64 MB) | Ceiling on book/cover response bytes (`maxContentLength`/`maxBodyLength`). Exceeding it rejects the axios request, which surfaces as `UpstreamError` → **HTTP 502**. |
+| `REQUEST_TIMEOUT_MS` | `20000` | Per-request timeout. |
+| `RETRY_COUNT` | `1` | Extra attempts on upstream failure. |
+
+`/download/:id/:format` only accepts `fb2, epub, mobi, pdf, txt, rtf, html, djvu, doc`;
+anything else is a **400** before any upstream call (the format is interpolated into the
+Flibusta URL path). The blueprint's `POST /flibusta/add` applies the matching guard
+against `_CONTENT_TYPES` (`fb2, epub, mobi, pdf`).
+
+**axios pin.** `axios` is pinned exactly (`1.20.0`, bumped from `1.2.6` in the final-fix
+wave) — this clears every advisory that applied to the `axios.get` surface the sidecar
+uses, including the `config.proxy` prototype-pollution MitM gadget that the new
+`FLIBUSTA_PROXY` support would otherwise be exposed to. `npm audit` still reports
+findings against **transitive** copies (`flibusta` → its own `axios@1.2.6` +
+`fast-xml-parser`, used only for OPDS XML, and dev-only `mocha` → `serialize-javascript`,
+plus `adm-zip`); clearing those requires `npm audit fix --force`, which downgrades
+`flibusta` to `0.4.1` — a breaking change, deliberately not taken.
 
 ## Running
 
@@ -778,9 +852,9 @@ file and a `cover.jpg` under `/books/<author>/<title> (2)/`.
   `meta.tags` on commas — so a category that itself contains a comma
   (`"Карьера, кадры"`) becomes two tags (`Карьера`, `кадры`). Cosmetic, not a Task 10
   deliverable.
-* **`has_cover` stays 0** even though `move_coverfile` writes `cover.jpg` (the generic
-  cover is used because `meta.cover` is `None`). The OPDS cover is not yet fed into
-  `meta.cover`.
+* ~~**`has_cover` stays 0**~~ — **fixed** in the final-fix wave: `_import_into_library`
+  now downloads the OPDS cover into the import temp dir and sets `meta.cover` before
+  `move_coverfile`, so the real cover lands at `<book_path>/cover.jpg`.
 * Calibre-Web's `POST /admin/ajaxconfig` did not persist `config_uploading` to `app.db` in
   this scripted run; the flag was set directly in `/config/app.db` and the container
   restarted. Toggling it in the UI works normally.

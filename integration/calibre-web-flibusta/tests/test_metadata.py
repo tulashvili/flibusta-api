@@ -26,6 +26,17 @@ def test_enrich_fills_empty_fields_from_opds():
     assert ("flibusta", "416925") in list(out.identifiers)
 
 
+def test_enrich_defaults_languages_to_ru_when_empty():
+    """Flibusta carries no OPDS language; blank would leave the book unlabelled."""
+    out = metadata.enrich(_blank(), {}, 5)
+    assert out.languages == "ru"
+
+
+def test_enrich_keeps_languages_detected_from_the_file():
+    out = metadata.enrich(_blank(languages="eng"), {}, 5)
+    assert out.languages == "eng"
+
+
 def test_enrich_does_not_overwrite_existing_file_metadata():
     meta = _blank(title="T", author="File Author", series="File Series",
                   description="from file")
