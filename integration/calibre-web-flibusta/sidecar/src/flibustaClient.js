@@ -53,10 +53,18 @@ async function rawGet(pathname, responseType) {
   return res;
 }
 
+// Flibusta stores cover images under /i/<bucket>/<id>/cover.<ext> where the
+// bucket is the book id modulo 100, zero-padded to two digits
+// (e.g. 416925 -> /i/25/416925/cover.jpg). Verified against real Flibusta.
+function coverBucket(flibustaId) {
+  return String(Number(flibustaId) % 100).padStart(2, '0');
+}
+
 async function fetchCover(flibustaId) {
-  const res = await rawGet(`/i/${String(flibustaId).slice(0, 2)}/${flibustaId}/cover.jpg`, 'stream')
+  const bucket = coverBucket(flibustaId);
+  const res = await rawGet(`/i/${bucket}/${flibustaId}/cover.jpg`, 'stream')
     .catch((err) => {
-      if (err instanceof NotFound) return rawGet(`/b/${flibustaId}/cover`, 'stream');
+      if (err instanceof NotFound) return rawGet(`/i/${bucket}/${flibustaId}/cover.png`, 'stream');
       throw err;
     });
   return { stream: res.data, contentType: res.headers['content-type'] || 'image/jpeg' };

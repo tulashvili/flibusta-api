@@ -30,6 +30,10 @@ function buildRouter(client) {
       const { stream, contentType } = await client.fetchCover(req.params.id);
       res.set('Content-Type', contentType);
       res.set('Cache-Control', 'public, max-age=86400');
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(502).json({ error: 'cover stream failed' });
+        res.destroy();
+      });
       return stream.pipe(res);
     } catch (err) {
       const code = err instanceof NotFound ? 404 : 502;

@@ -1,6 +1,7 @@
 const { expect } = require('chai');
 const express = require('express');
 const http = require('http');
+const { Readable } = require('stream');
 const { buildRouter } = require('../src/routes');
 const { NotFound, UpstreamError } = require('../src/flibustaClient');
 
@@ -17,7 +18,7 @@ function get(port, path) {
     http.get({ port, path }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
     });
   });
 }
@@ -59,6 +60,51 @@ describe('sidecar routes', () => {
     const { server, port } = await startServer(client);
     expect((await get(port, '/download/404/fb2')).status).to.equal(404);
     expect((await get(port, '/download/9/fb2')).status).to.equal(502);
+    server.close();
+  });
+
+  it('GET /cover pipes the client stream through', async () => {
+    const client = {
+      fetchCover: async () => ({ stream: Readable.from([Buffer.from('JPEGDATA')]), contentType: 'image/jpeg' }),
+    };
+    const { server, port } = await startServer(client);
+    const res = await get(port, '/cover/416925');
+    expect(res.status).to.equal(200);
+    expect(res.headers['content-type']).to.equal('image/jpeg');
+    expect(res.body.toString()).to.equal('JPEGDATA');
+    server.close();
+  });
+
+  it('GET /cover maps NotFound to 404', async () => {
+    const client = { fetchCover: async () => { throw new NotFound('no cover'); } };
+    const { server, port } = await startServer(client);
+    const res = await get(port, '/cover/1');
+    expect(res.status).to.equal(404);
+    server.close();
+  });
+
+  it('GET /search maps UpstreamError to 502', async () => {
+    const client = { search: async () => { throw new UpstreamError('flibusta down'); } };
+    const { server, port } = await startServer(client);
+    const res = await get(port, '/search?q=x');
+    expect(res.status).to.equal(502);
+    server.close();
+  });
+
+  it('GET /download with an empty buffer returns 422', async () => {
+    const client = { fetchBook: async () => Buffer.alloc(0) };
+    const { server, port } = await startServer(client);
+    const res = await get(port, '/download/1/fb2');
+    expect(res.status).to.equal(422);
+    server.close();
+  });
+
+  it('GET /download sets a Content-Disposition header', async () => {
+    const client = { fetchBook: async () => Buffer.from('<?xml version="1.0"?><FictionBook/>') };
+    const { server, port } = await startServer(client);
+    const res = await get(port, '/download/1/fb2?title=My%20Book');
+    expect(res.status).to.equal(200);
+    expect(res.headers['content-disposition']).to.match(/attachment; filename="My Book\.fb2"/);
     server.close();
   });
 });
