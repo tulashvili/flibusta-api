@@ -954,6 +954,20 @@ A second add using a full search result as `item` (`flibustaId=457363`) produced
 `Роберт Тору Кийосаки`, series `Богатый папа`, series_index `1.0`, comments, the `.fb2`
 file and a `cover.jpg` under `/books/<author>/<title> (2)/`.
 
+### Multi-format smoke (2026-08-27, same containers)
+
+| # | Check | Result |
+|---|---|---|
+| 9 | `POST /add {"flibustaId":178419,"formats":["fb2","mobi"]}` on a **new** book | **PASS** — `200 {"status":"added","bookId":5,"formats":{"added":["fb2","mobi"],"skipped":[],"failed":[]}}`; `data` rows `(5,'FB2'),(5,'MOBI')`; on disk `Крестный отец (5).mobi` (2 836 276 B) next to the `.fb2` and `cover.jpg` |
+| 10 | Same request repeated | **PASS** — `already_exists`, `formats.skipped == ["fb2","mobi"]`, no duplicate `data` rows |
+| 11 | `formats:["fb2","mobi"]` on a book **already in the library as fb2 only** (`159352` → book 4) | **PASS** — `already_exists`, `formats == {"added":["mobi"],"skipped":["fb2"],"failed":[]}`; `data` gains `(4,'MOBI')`. This is the "Upload Format" path proper |
+| 12 | `formats:["fb2","exe"]` | **PASS** — `400 {"error":"Unsupported format: exe"}`, nothing downloaded |
+
+Note: `upload_book_formats` calls `uploader.process(..., no_cover=book.has_cover)`, so on
+a book whose `has_cover` is still 0 the extracted cover is left beside the file as
+`<bookfolder>.mobi.jpg`. That is stock Calibre-Web behaviour (the book-edit page passes
+the same argument), not something the blueprint adds.
+
 ### Known issues found while smoking
 
 * **Tag splitting.** `metadata.enrich` joins categories with `","`, and Calibre-Web splits
