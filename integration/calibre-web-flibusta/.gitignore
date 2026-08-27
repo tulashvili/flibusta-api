@@ -1,3 +1,4 @@
 .calibre-web-src/
 *.pyc
 __pycache__/
+.venv/
