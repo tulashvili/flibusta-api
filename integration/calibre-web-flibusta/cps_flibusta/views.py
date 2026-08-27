@@ -8,14 +8,27 @@ import os
 import shutil
 import tempfile
 
-from flask import Blueprint, Response, abort, jsonify, render_template, request, url_for
+from flask import Blueprint, Response, abort, jsonify, request, url_for
 
-from cps import calibre_db, config
+from cps import calibre_db, config, logger
 from cps.cw_login import current_user, login_required
+from cps.render_template import render_title_template
 
 from . import dedup
 from . import metadata
 from . import sidecar
+
+log = logger.create()
+
+# Declared content types for the FileStorage handed to Calibre-Web's uploader.
+# 0.6.27's validate_mime_type() may consult the declared type, so send a real one
+# instead of a blanket application/octet-stream.
+_CONTENT_TYPES = {
+    "fb2": "application/x-fictionbook+xml",
+    "epub": "application/epub+zip",
+    "mobi": "application/x-mobipocket-ebook",
+    "pdf": "application/pdf",
+}
 
 flibusta = Blueprint(
     "flibusta",
@@ -35,7 +48,9 @@ def _require_permission():
 @login_required
 def index():
     _require_permission()
-    return render_template("flibusta.html", title="Download Books", page="flibusta")
+    # render_title_template (not flask.render_template): layout.html needs the
+    # context Calibre-Web injects here (accept, sidebar, g.*) or it raises.
+    return render_title_template("flibusta.html", title="Download Books", page="flibusta")
 
 
 @flibusta.route("/search")
@@ -92,7 +107,7 @@ def add():
     fid = payload.get("flibustaId")
     fmt = payload.get("format")
     opds_item = payload.get("item") or {}
-    if not fid or not fmt:
+    if fid is None or not fmt:
         return jsonify({"error": "flibustaId and format are required"}), 400
 
     try:
@@ -114,12 +129,14 @@ def add():
     except sidecar.UpstreamError:
         return jsonify({"error": "Flibusta is unreachable, try again later"}), 502
 
+    filename = _safe_filename(filename, fmt)
+
     tmp_dir = tempfile.mkdtemp(prefix="flibusta_")
     tmp_path = os.path.join(tmp_dir, filename)
     try:
         with open(tmp_path, "wb") as fh:
             fh.write(content)
-        book_id = _import_into_library(tmp_path, filename, opds_item, fid)
+        book_id = _import_into_library(tmp_path, filename, opds_item, fmt, fid)
     except Exception as exc:  # noqa: BLE001 - session already rolled back below
         return jsonify({"error": "Import failed", "detail": str(exc)}), 500
     finally:
@@ -129,7 +146,23 @@ def add():
                     "url": url_for("web.show_book", book_id=book_id)})
 
 
-def _import_into_library(tmp_path, filename, opds_item, flibusta_id):
+def _safe_filename(filename, fmt):
+    """Never trust the sidecar's Content-Disposition filename.
+
+    It is parsed from a remote header and may contain path separators
+    (`../../app/calibre-web/cps/evil.py`), which would escape the temp dir when
+    joined. Strip to a bare basename; fall back to `book.<fmt>` when what's left
+    is empty or carries no extension (the extension is load-bearing — Calibre-Web
+    derives the DB format string from it).
+    """
+    base = os.path.basename(filename or "").replace("\\", "/")
+    base = os.path.basename(base).strip()
+    if not base or base in (".", "..") or "." not in base or base.startswith("."):
+        return "book.{}".format(fmt)
+    return base
+
+
+def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
     """Mirror of `cps.editbooks.upload()`'s btn-upload branch (Calibre-Web 0.6.27,
     README section 3), with two adaptations:
 
@@ -163,8 +196,9 @@ def _import_into_library(tmp_path, filename, opds_item, flibusta_id):
         calibre_db.create_functions(config)
 
         with open(tmp_path, "rb") as fh:
-            storage = FileStorage(stream=fh, filename=filename,
-                                  content_type="application/octet-stream")
+            content_type = _CONTENT_TYPES.get(
+                str(fmt).lower().lstrip("."), "application/octet-stream")
+            storage = FileStorage(stream=fh, filename=filename, content_type=content_type)
             meta, error = file_handling_on_upload(storage)
             if error:
                 raise RuntimeError("file rejected by Calibre-Web")
@@ -179,13 +213,18 @@ def _import_into_library(tmp_path, filename, opds_item, flibusta_id):
             book_id = db_book.id
 
             # non-gdrive branch only (see docstring)
-            helper.update_dir_structure(
+            dir_error = helper.update_dir_structure(
                 book_id,
                 config.get_book_path(),
                 input_authors[0],
                 meta.file_path,
                 title_dir + meta.extension.lower(),
             )
+            if dir_error:
+                # Non-fatal upstream too (the DB row is kept), but an on-disk move
+                # failure must not vanish silently.
+                log.error("Flibusta import: update_dir_structure failed for book %s: %s",
+                          book_id, dir_error)
             move_coverfile(meta, db_book)
             if modify_date:
                 calibre_db.set_metadata_dirty(book_id)

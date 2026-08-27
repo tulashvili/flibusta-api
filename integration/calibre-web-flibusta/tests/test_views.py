@@ -162,3 +162,34 @@ def test_blueprint_ships_template_and_static_assets():
     assert os.path.isfile(os.path.join(root, "static", "flibusta.js"))
     assert os.path.isfile(os.path.join(root, "static", "flibusta.css"))
     assert views.flibusta.has_static_folder
+
+
+def test_index_uses_calibre_web_render_title_template(app):
+    """layout.html needs render_title_template's context, not flask.render_template."""
+    from cps_flibusta import views
+
+    assert views.render_title_template is not None
+    resp = app.test_client().get("/flibusta/")
+    assert resp.status_code == 200
+    assert resp.get_data(as_text=True) == "rendered:flibusta.html"
+
+
+def test_index_does_not_use_flask_render_template():
+    import inspect
+
+    from cps_flibusta import views
+
+    src = inspect.getsource(views.index)
+    assert "render_title_template(" in src
+    assert not hasattr(views, "render_template")
+
+
+def test_js_escapes_quotes_for_attribute_contexts():
+    """flibusta.js injects sidecar values into double-quoted HTML attributes."""
+    import os
+
+    from cps_flibusta import views
+
+    js = open(os.path.join(os.path.dirname(views.__file__), "static", "flibusta.js")).read()
+    for needle in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
+        assert needle in js, "esc() must produce {}".format(needle)

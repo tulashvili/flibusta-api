@@ -35,6 +35,25 @@ def install():
     sys.modules["cps.editbooks"] = types.ModuleType("cps.editbooks")
     sys.modules["cps.helper"] = cps.helper
 
+    logger_mod = types.ModuleType("cps.logger")
+    logger_mod.create = lambda: types.SimpleNamespace(
+        error=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+        info=lambda *a, **k: None,
+        debug=lambda *a, **k: None,
+    )
+    sys.modules["cps.logger"] = logger_mod
+    cps.logger = logger_mod
+
+    # Calibre-Web renders through render_title_template, which injects the extra
+    # context layout.html needs (accept, sidebar, g.*).
+    render_template_mod = types.ModuleType("cps.render_template")
+    render_template_mod.render_title_template = (
+        lambda template, **kwargs: "rendered:{}".format(template)
+    )
+    sys.modules["cps.render_template"] = render_template_mod
+    cps.render_template = render_template_mod
+
     cw_login = types.ModuleType("cps.cw_login")
     cw_login.login_required = _login_required
     cw_login.current_user = types.SimpleNamespace(role_upload=lambda: True)

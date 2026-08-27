@@ -14,10 +14,16 @@
     errBox.style.display = msg ? 'block' : 'none';
   }
 
+  // Escapes for BOTH text and double-quoted attribute contexts. textContent/innerHTML
+  // alone does not escape quotes, so a value like `" onerror="alert(1)` would break
+  // out of an attribute. Flibusta data is attacker-controllable — escape quotes too.
   function esc(s) {
-    var d = document.createElement('div');
-    d.textContent = s == null ? '' : String(s);
-    return d.innerHTML;
+    return (s == null ? '' : String(s))
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function bookUrl(id) {
