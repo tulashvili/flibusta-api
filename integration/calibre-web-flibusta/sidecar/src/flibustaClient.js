@@ -29,6 +29,7 @@ function proxyConfig() {
     if (u.username) cfg.auth = { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password || '') };
     return cfg;
   } catch (err) {
+    console.warn('invalid FLIBUSTA_PROXY, ignoring:', err.message);
     return false;
   }
 }

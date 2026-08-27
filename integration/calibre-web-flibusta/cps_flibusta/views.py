@@ -4,6 +4,7 @@ Auth note: Calibre-Web 0.6.27 does NOT ship `flask_login` — it vendors the log
 machinery as `cps.cw_login` (see README section 4/8). Import auth helpers from there.
 """
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -197,7 +198,7 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
         move_coverfile,
     )
 
-    book_dir = None
+    db_book = None
     try:
         modify_date = False
         # create the function for sorting... (upstream comment)
@@ -219,7 +220,6 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
             modify_date |= edit_book_comments(Markup(meta.description or "").unescape(), db_book)
 
             book_id = db_book.id
-            book_dir = _library_book_dir(db_book)
 
             # Feed the OPDS cover into meta.cover so move_coverfile copies a real
             # cover instead of Calibre-Web's generic one. BookMeta is immutable.
@@ -251,8 +251,14 @@ def _import_into_library(tmp_path, filename, opds_item, fmt, flibusta_id):
         calibre_db.session.rollback()
         # Spec step 8: the DB rollback alone leaves the on-disk directory that
         # update_dir_structure / move_coverfile may already have created.
-        if book_dir:
-            _safe_rmtree(book_dir)
+        # Resolve the path HERE, not earlier: create_book_on_upload sets an
+        # id-less `<author>/<title>`, and update_dir_structure then renames the
+        # dir to `<author>/<title> (<id>)` and rewrites db_book.path. A snapshot
+        # taken before that rename would point at a path that no longer exists.
+        if db_book is not None:
+            book_dir = _library_book_dir(db_book)
+            if book_dir:
+                _safe_rmtree(book_dir)
         raise
 
 
@@ -279,12 +285,14 @@ def _fetch_cover_file(flibusta_id, dest_dir):
     Calibre-Web's generic cover.
     """
     try:
-        upstream = sidecar.cover_response(flibusta_id)
         path = os.path.join(dest_dir, "cover.jpg")
-        with open(path, "wb") as fh:
-            for chunk in upstream.iter_content(chunk_size=8192):
-                if chunk:
-                    fh.write(chunk)
+        # closing(): cover_response is a streamed requests.Response — without an
+        # explicit close its connection is never returned to the pool.
+        with contextlib.closing(sidecar.cover_response(flibusta_id)) as upstream:
+            with open(path, "wb") as fh:
+                for chunk in upstream.iter_content(chunk_size=8192):
+                    if chunk:
+                        fh.write(chunk)
         if os.path.getsize(path) == 0:
             os.unlink(path)
             return None

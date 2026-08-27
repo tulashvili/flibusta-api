@@ -400,7 +400,13 @@ def _wire_editbooks(tmp_path, book_dir_name="A/T (1)", move_cover=None):
 
 
 class _CoverUpstream:
+    """Stand-in for the streamed requests.Response returned by cover_response."""
+
     headers = {"Content-Type": "image/jpeg"}
+    closed = False
+
+    def close(self):
+        self.closed = True
 
     def iter_content(self, chunk_size=8192):
         yield b"\xff\xd8\xff"
@@ -417,8 +423,9 @@ def test_import_feeds_opds_cover_into_meta_cover(app, monkeypatch, tmp_path):
         cover=m.cover, exists=bool(m.cover) and os.path.exists(m.cover),
         size=os.path.getsize(m.cover) if m.cover and os.path.exists(m.cover) else 0))
 
+    upstream = _CoverUpstream()
     monkeypatch.setattr(metadata, "enrich", lambda m, i, f: m)
-    monkeypatch.setattr(views.sidecar, "cover_response", lambda fid: _CoverUpstream())
+    monkeypatch.setattr(views.sidecar, "cover_response", lambda fid: upstream)
 
     f = tmp_path / "book.fb2"
     f.write_bytes(b"x")
@@ -427,6 +434,7 @@ def test_import_feeds_opds_cover_into_meta_cover(app, monkeypatch, tmp_path):
     assert seen["exists"]
     assert seen["size"] == len(b"\xff\xd8\xffJPEGBYTES")
     assert os.path.dirname(seen["cover"]) == str(tmp_path)
+    assert upstream.closed, "the streamed cover response was not closed"
 
 
 def test_import_survives_a_missing_cover(app, monkeypatch, tmp_path):
@@ -459,6 +467,20 @@ def test_import_removes_library_dir_when_move_coverfile_fails(app, monkeypatch, 
 
     root, book_dir = _wire_editbooks(tmp_path, move_cover=explode)
 
+    # update_dir_structure RENAMES <author>/<title> to <author>/<title> (<id>)
+    # and updates db_book.path. The rollback must target the *renamed* dir, so
+    # the path cannot be snapshotted before this runs.
+    import sys
+
+    db_book = sys.modules["cps.editbooks"].create_book_on_upload(False, None)[0]
+    renamed = root / "A" / "T (55)"
+
+    def rename(*a):
+        book_dir.rename(renamed)
+        db_book.path = "A/T (55)"
+
+    sys.modules["cps.helper"].update_dir_structure = rename
+
     rolled_back = []
     views.calibre_db.session.rollback = lambda: rolled_back.append(True)
     monkeypatch.setattr(metadata, "enrich", lambda m, i, f: m)
@@ -471,6 +493,7 @@ def test_import_removes_library_dir_when_move_coverfile_fails(app, monkeypatch, 
         views._import_into_library(str(f), "book.fb2", {}, "fb2", 1)
 
     assert rolled_back == [True]
+    assert not renamed.exists(), "renamed library dir survived the rollback"
     assert not book_dir.exists(), "library dir survived the rollback"
     assert root.exists(), "the library root itself must never be removed"
 
