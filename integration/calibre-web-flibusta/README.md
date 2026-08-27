@@ -70,30 +70,127 @@ attached to that same book exactly like Calibre-Web's "Upload Format" button.
   - If you hand-build the schema, `books.series_index` **must** have `REAL` affinity
     (with `VARCHAR` the stock book-edit page 500s in `cps/jinjia.py:formatfloat`).
 
-## Running
+## Deploying on your own server
+
+The image is built locally from this repo — there is nothing to pull from a registry.
+
+### 1. Get the code onto the server
 
 ```bash
+git clone https://github.com/tulashvili/flibusta-api.git
+cd flibusta-api
+git checkout feature/calibre-web-flibusta-integration   # not yet merged to master
+cd integration/calibre-web-flibusta
+```
+
+### 2. Adjust `docker-compose.yml` for your host
+
+| Setting | Change to |
+| --- | --- |
+| `PUID` / `PGID` (calibre-web) | your host user: `id -u` / `id -g`. The files in `./data` are written as this user. |
+| `TZ` | your timezone, e.g. `Europe/Tbilisi`. |
+| `ports: "8083:8083"` | `"127.0.0.1:8083:8083"` if a reverse proxy sits in front (recommended), or another host port. |
+| `FLIBUSTA_BASE_URL` (sidecar) | leave as `https://flibusta.is/`. If your server can't reach Flibusta directly, uncomment `FLIBUSTA_PROXY` and point it at an egress proxy. |
+
+The sidecar port (`8080`) is internal to the compose network — do **not** publish it.
+
+Other sidecar knobs (all optional, set under the `flibusta-sidecar` `environment:`):
+`REQUEST_TIMEOUT_MS` (20000), `RETRY_COUNT` (1), `MAX_DOWNLOAD_BYTES` (67108864),
+`USER_AGENT`.
+
+### 3. Seed the Calibre library
+
+`./data/books` must contain a valid `metadata.db` before first start — see
+**Prerequisites**. Create the directory with the right owner first:
+
+```bash
+mkdir -p data/config data/books
+sudo chown -R "$(id -u):$(id -g)" data
+# then copy an existing Calibre library into ./data/books, or:
+#   calibredb --with-library ./data/books add_empty      # if you have calibre on the host
+```
+
+### 4. Build and start
+
+```bash
+docker compose build
+docker compose up -d
+docker compose ps                 # both services "Up"; sidecar becomes "healthy" after ~30s
+docker compose logs -f calibre-web   # watch for a clean startup, Ctrl-C to stop tailing
+```
+
+### 5. First run (in the browser)
+
+1. Open the site, log in as **`admin` / `admin123`**, and **change the admin password
+   immediately** — the default is public knowledge.
+2. **Admin → Database Configuration** — point it at `/books` (must already contain
+   `metadata.db`; Calibre-Web will not create one).
+3. **Admin → Basic Configuration → Uploading** — tick *Enable Uploads*, and make sure
+   every format you'll want (`fb2`, `epub`, `mobi`, `pdf`) is in the allowed upload
+   formats list. Formats not on that list are rejected by `/flibusta/add` with a
+   clear error.
+4. **Re-open that page and confirm *Enable Uploads* is still ticked.** Without it,
+   `/flibusta/` returns **403** — the blueprint gates on `config.config_uploading`
+   and `current_user.role_upload()`. (In one scripted run the config POST didn't
+   persist; toggling in the UI works.)
+5. **"Download Books"** now appears in the top navbar. Search → tick one or more
+   formats on a result card (the first ticked is the *primary* and creates the book;
+   the rest are attached like "Upload Format") → **Add**.
+
+### 6. Behind a reverse proxy (nginx / Caddy / Traefik)
+
+Terminate TLS at the proxy and forward to `127.0.0.1:8083`. You **must** pass the
+scheme through or Calibre-Web's CSRF check on `POST /flibusta/add` (and its own forms)
+will reject requests:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8083;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;   # required for CSRF/cookies over HTTPS
+    proxy_set_header X-Scheme          $scheme;
+}
+```
+
+Caddy: `reverse_proxy 127.0.0.1:8083` already sets these. In **Admin → Basic
+Configuration → Server** enable *"Allow Reverse Proxy Authentication"* only if you
+actually run proxy auth; otherwise leave it off.
+
+### 7. Persistence & backups
+
+Everything stateful is in the two bind mounts (git-ignored):
+
+- `./data/config` — `app.db` (users, settings, `flibusta:<id>` history lives in the
+  library, not here), Calibre-Web logs, session keys.
+- `./data/books` — the Calibre library: `metadata.db` + `<author>/<title>/` folders
+  with the book files and covers.
+
+Back up both together (stop the stack or snapshot the volume for a consistent
+`metadata.db`). Imported books and their `flibusta:<id>` identifiers live in
+`./data/books/metadata.db`.
+
+### 8. Updating a deployed instance
+
+```bash
+cd flibusta-api && git pull
 cd integration/calibre-web-flibusta
 docker compose build
 docker compose up -d
-# http://localhost:8083
+```
+
+If you bump the pinned Calibre-Web base image, follow
+**"Updating the pinned Calibre-Web release"** below first — the two core patches carry
+version-specific context lines and must be regenerated.
+
+### Quick local test (no server)
+
+```bash
+cd integration/calibre-web-flibusta
+docker compose build && docker compose up -d      # http://localhost:8083
 ```
 
 `./data/config` and `./data/books` are git-ignored bind mounts.
-
-## First run
-
-1. Log in as `admin` / `admin123` and change the password.
-2. **Admin → Database Configuration** — point it at `/books`. The folder must already
-   contain a valid `metadata.db` (see Prerequisites); Calibre-Web will not create one.
-3. **Admin → Basic Configuration → Uploading** — tick *Enable Uploads* and make sure
-   `fb2` (and `epub`) are in the allowed upload formats.
-4. **Verify the upload toggle persisted.** Re-open Admin → Basic Configuration →
-   Uploading and confirm *Enable Uploads* is still ticked (in one scripted run
-   `POST /admin/ajaxconfig` did not persist `config_uploading` to `app.db`; toggling
-   it in the UI works normally). Without it, `/flibusta/` returns **403** — the
-   blueprint gates on `config.config_uploading` and `current_user.role_upload()`.
-5. "Download Books" now appears in the top navbar. Search, pick a format, add.
 
 ## The `flibusta:<id>` identifier convention
 
@@ -867,7 +964,11 @@ confirmed against the pinned release". Confirmed differences:
 
 ---
 
-# Deployment (Task 10)
+# Build & release internals (maintenance reference)
+
+> For deploying, use **"Deploying on your own server"** near the top. This section
+> records how the image and patches are built and what was verified, for whoever
+> maintains the integration or bumps the pinned base image.
 
 ## Files
 
@@ -911,31 +1012,6 @@ findings against **transitive** copies (`flibusta` → its own `axios@1.2.6` +
 `fast-xml-parser`, used only for OPDS XML, and dev-only `mocha` → `serialize-javascript`,
 plus `adm-zip`); clearing those requires `npm audit fix --force`, which downgrades
 `flibusta` to `0.4.1` — a breaking change, deliberately not taken.
-
-## Running
-
-```bash
-cd integration/calibre-web-flibusta
-docker compose build
-docker compose up -d
-# http://localhost:8083
-```
-
-`./data/config` and `./data/books` are bind mounts (git-ignored).
-
-## First run
-
-1. Log in as `admin` / `admin123` and change the password.
-2. You are redirected to **Admin → Database Configuration**. Point it at `/books`.
-   The folder must already contain a valid Calibre `metadata.db` — Calibre-Web will not
-   create one. Either copy an existing Calibre library into `./data/books`, or create one
-   with Calibre's `calibredb`. (If you hand-build the schema, `books.series_index` **must**
-   have `REAL` affinity — with `VARCHAR` the stock book-edit page 500s inside
-   `cps/jinjia.py:formatfloat`.)
-3. **Admin → Basic Configuration → Uploading**: tick *Enable Uploads* and make sure `fb2`
-   is in the allowed upload formats. Without this, `/flibusta/` returns **403** (the
-   blueprint gates on `config.config_uploading` and `current_user.role_upload()`).
-4. "Download Books" now appears in the top navbar.
 
 ## Smoke test results (2026-08-27, real containers, pinned digest)
 
